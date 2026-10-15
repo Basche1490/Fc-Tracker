@@ -1133,12 +1133,21 @@ local function try_read_atlas_match_stats(managed_team_id, is_home, goals_agains
             local p_sacc = 0
             if p_shots > 0 and sot > 0 then p_sacc = math.min(100, math.floor((sot / p_shots) * 100)) end
             local p_tackles = to_int(p.tackles, 0)
-            local p_tackles_comp = to_num(p.tackles_completed, p_tackles)
             local p_tpct
             if tonumber(p.stand_tackle_success_pct_derived) then
                 p_tpct = to_int(percent_value(p.stand_tackle_success_pct_derived))
             else
-                p_tpct = (p_tackles > 0) and math.min(100, math.floor((p_tackles_comp / p_tackles) * 100)) or 0
+                -- The exporter leaves that column blank for a player with no stand tackles (slide tackles only):
+                -- use all tackles won / attempted instead of reporting 100%.
+                local attempts, won
+                if p.stand_tackles ~= nil or p.slide_tackles ~= nil then
+                    attempts = to_num(p.stand_tackles, 0) + to_num(p.slide_tackles, 0)
+                    won = to_num(p.stand_tackles_won, 0) + to_num(p.slide_tackles_won, 0)
+                else
+                    attempts = p_tackles
+                    won = to_num(p.tackles_completed, p_tackles)
+                end
+                p_tpct = (attempts > 0) and math.min(100, math.floor((won / attempts) * 100)) or 0
             end
             local p_interceptions = to_int(p.interceptions, 0)
             local is_m = (p_name == motm_player) or truthy_flag(p.man_of_the_match)
@@ -2255,8 +2264,9 @@ end
 -- Match detection. A finished fixture is queued; the Atlas exporter needs a few seconds to write
 -- the detailed stats, so the match is sent as soon as they appear (or after a short wait without them).
 -- ---------------------------------------------------------------------------
-local ATLAS_WAIT_SECONDS = 30       -- exporter has been seen on this PC
-local ATLAS_WAIT_SECONDS_IDLE = 10  -- no export ever seen: do not hold matches back for long
+local ATLAS_WAIT_SECONDS = 30           -- an export has been seen on this PC before
+local ATLAS_WAIT_SECONDS_EXPORTER = 45  -- the Atlas exporter is running: its snapshot + match export takes a while
+local ATLAS_WAIT_SECONDS_IDLE = 10      -- no exporter and no export ever seen: do not hold matches back for long
 local ATLAS_POLL_SECONDS = 4
 
 local SCRIPT_DIR = ""
@@ -2268,7 +2278,41 @@ do
     end
 end
 
+-- The Project Atlas exporter is the "FC26 AutoCapture" script from the Reddit post (FC26_AutoCapture_v1.1.1.lua).
+-- It has the snapshot and the detailed MatchStats exporters built in and publishes both after every finished
+-- match. It is what produces the detailed player statistics this script sends to the phone.
+local ATLAS_EXPORTER_FILES = { "FC26_AutoCapture_v1.1.1.lua", "FC26_AutoCapture.lua" }
+
+local function atlas_exporter_active()
+    return rawget(_G, "FC26_EXPORT_AUTO_CAPTURE_STATE") ~= nil
+        or rawget(_G, "FC26_EXPORT_MATCH_STATS_AUTOMATIC_PLAYER_EXPORTER_STATE") ~= nil
+end
+
+-- Starts the Atlas exporter next to this script unless it is already running (running it twice is harmless).
+local function start_atlas_exporter()
+    if atlas_exporter_active() then
+        log_monitor("Project Atlas exporter is already running")
+        return true
+    end
+    for _, name in ipairs(ATLAS_EXPORTER_FILES) do
+        for _, base in ipairs({ SCRIPT_DIR, "" }) do
+            local path = base .. name
+            if file_exists(path) then
+                log_monitor("Starting the Project Atlas exporter: " .. path)
+                local ok, err = pcall(dofile, path)
+                if not ok then log_monitor("Project Atlas exporter error: " .. tostring(err)) end
+                return ok
+            end
+        end
+    end
+    log_monitor("Project Atlas exporter (" .. ATLAS_EXPORTER_FILES[1] .. ") not found next to this script. " ..
+        "Matches are still sent, but without the detailed player statistics.")
+    return false
+end
+
 local function run_snapshot()
+    -- FC26 AutoCapture publishes the paired snapshot by itself; a second one would only slow the game down
+    if rawget(_G, "FC26_EXPORT_AUTO_CAPTURE_STATE") ~= nil then return true end
     for _, path in ipairs({ SCRIPT_DIR .. "FC26_Snapshot.lua", "FC26_Snapshot.lua" }) do
         if file_exists(path) then
             local ok, err = pcall(dofile, path)
@@ -2346,7 +2390,12 @@ local function service_pending_matches()
         if atlas_names and #atlas_names > 0 then state.atlas_seen = true end
     end
 
-    local limit = state.atlas_seen and ATLAS_WAIT_SECONDS or ATLAS_WAIT_SECONDS_IDLE
+    local limit = ATLAS_WAIT_SECONDS_IDLE
+    if atlas_exporter_active() then
+        limit = ATLAS_WAIT_SECONDS_EXPORTER
+    elseif state.atlas_seen then
+        limit = ATLAS_WAIT_SECONDS
+    end
     if not atlas_path and waited < limit then return end
 
     table.remove(state.pending_matches, 1)
@@ -2434,7 +2483,7 @@ function FC26_AutoCapture_Status()
     print("Club: " .. tostring(state.managed_team_name) .. " (ID " .. tostring(state.managed_team_id) .. ")")
     print("Matches waiting for Atlas stats: " .. tostring(#state.pending_matches))
     print("Payloads not yet acknowledged by the bridge: " .. tostring(pending_out))
-    print("Atlas exporter seen: " .. tostring(state.atlas_seen))
+    print("Atlas exporter running: " .. tostring(atlas_exporter_active()) .. " | export folder seen: " .. tostring(state.atlas_seen))
     local f = io.open(SEND_LOG, "r")
     if f then
         local lines = {}
@@ -2501,10 +2550,21 @@ end)
 
 log_monitor(string.format("Monitoring armed for %s (ID: %d). Completed matches baseline: %d. Instance: %s",
     state.managed_team_name, state.managed_team_id, state.last_count, SCRIPT_INSTANCE))
+
+-- Detailed player statistics come from the Project Atlas exporter: start it unless it is already running
+local atlas_started = false
+do
+    local okA, resA = xpcall(start_atlas_exporter, debug.traceback)
+    if okA then atlas_started = resA == true else log_monitor("Could not start the Atlas exporter: " .. tostring(resA)) end
+end
 print("=========================================================================")
 print(" [FC26 AutoCapture v" .. VERSION .. " ACTIVE] Tracking " .. state.managed_team_name .. "!")
 print(" Real Data Capture: Match Telemetry & Instant Real-Time Transfer Tracking.")
-print(" Matches wait up to " .. ATLAS_WAIT_SECONDS .. "s for the Atlas export so the detailed stats are included.")
+if atlas_started then
+    print(" Project Atlas exporter: running (detailed player stats). Matches wait up to " .. ATLAS_WAIT_SECONDS_EXPORTER .. "s for its export.")
+else
+    print(" Project Atlas exporter: NOT running - put FC26_AutoCapture_v1.1.1.lua next to this script for detailed player stats.")
+end
 print(" Delivery log: Documents\\FC26 Export\\bridge_send_log.txt (undelivered items are retried).")
 print(" Background timer active (2s loop). Event listeners hooked.")
 print(" Safe Startup: No old matches beamed on launch.")

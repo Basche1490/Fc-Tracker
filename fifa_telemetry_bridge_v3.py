@@ -685,7 +685,17 @@ def import_atlas_folder(folder, folder_id, snapshots_ready):
             p_shots = _i(p.get("shots") or p_goals)
             p_sacc = min(100, int((_i(p.get("shots_on_target")) / max(1, p_shots)) * 100)) if p_shots > 0 else 0
             p_tackles = _i(p.get("tackles"))
-            p_tpct = _i(_pct(p.get("stand_tackle_success_pct_derived"))) if _f(p.get("stand_tackle_success_pct_derived"), -1) >= 0 else ((min(100, int(_f(p.get("tackles_completed"), p_tackles) / p_tackles * 100))) if p_tackles > 0 else 0)
+            if _f(p.get("stand_tackle_success_pct_derived"), -1) >= 0:
+                p_tpct = _i(_pct(p.get("stand_tackle_success_pct_derived")))
+            else:
+                # blank for a player with no stand tackles (slide tackles only): use all tackles won / attempted
+                if p.get("stand_tackles") is not None or p.get("slide_tackles") is not None:
+                    t_att = _f(p.get("stand_tackles")) + _f(p.get("slide_tackles"))
+                    t_won = _f(p.get("stand_tackles_won")) + _f(p.get("slide_tackles_won"))
+                else:
+                    t_att = float(p_tackles)
+                    t_won = _f(p.get("tackles_completed"), p_tackles)
+                p_tpct = min(100, int(t_won / t_att * 100)) if t_att > 0 else 0
             is_motm = (p_name == top_player or str(p.get("man_of_the_match") or "").lower() in ("true", "1"))
 
             player_perfs.append({

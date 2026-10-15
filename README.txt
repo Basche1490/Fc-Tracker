@@ -18,11 +18,16 @@ How to send matches and transfers from the game to your phone in REAL TIME:
    `telemetry_sync.lua` is the older all-in-one script; it still works and stands down by itself while
    FC26_Auto_Capture.lua is running.
 
-   For the fullest match statistics (passes, shots, tackles, xG, possession...), also run the Project Atlas
-   exporters `FC26_MatchStatsExport.lua` and `FC26_Snapshot.lua` in the Career Hub (the comment at the top
-   of each file says when to run it).
-   When a match ends, FC26_Auto_Capture.lua waits up to 30 seconds for that export so the detailed
-   numbers are included. If no export arrives it sends the match from the game database instead.
+   DETAILED PLAYER STATISTICS (passes, shots, tackles, xG, real ratings, man of the match) come from the
+   Project Atlas exporter by its original author (r/seriousfifacareers). Keep these files together in the same
+   Live Editor scripts folder:
+     FC26_Auto_Capture.lua          sends everything to the phone (run this one)
+     FC26_AutoCapture_v1.1.1.lua    the Atlas exporter; FC26_Auto_Capture.lua starts it for you
+   When a match ends, FC26_Auto_Capture.lua waits up to 45 seconds for the exporter's files so the detailed
+   numbers are included. If none arrive it sends the match from the game database instead (estimated detail).
+   `FC26_MatchStatsExport.lua` and `FC26_Snapshot.lua` are the complete original exporters that are built into
+   FC26_AutoCapture_v1.1.1.lua. They are only needed if you want to run the exporters on their own; do not run
+   them at the same time as FC26_AutoCapture_v1.1.1.lua.
 
 3. Playing matches (important Career Mode step):
    - When a match finishes, click 'Advance' on the post-match summary to return to the Career Central Hub.

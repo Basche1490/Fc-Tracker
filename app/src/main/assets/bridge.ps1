@@ -757,10 +757,16 @@ function Import-AtlasFolder {
         $pTackles = ConvertTo-Int $p.tackles
         if ((ConvertTo-Dbl $p.stand_tackle_success_pct_derived -1.0) -ge 0) {
             $pTacklePct = ConvertTo-Int (ConvertTo-Pct $p.stand_tackle_success_pct_derived)
-        } elseif ($pTackles -gt 0) {
-            $pTacklePct = [Math]::Min(100, [int][Math]::Floor(((ConvertTo-Dbl $p.tackles_completed $pTackles) / $pTackles) * 100))
         } else {
-            $pTacklePct = 0
+            # blank for a player with no stand tackles (slide tackles only): use all tackles won / attempted
+            if (($null -ne $p.stand_tackles) -or ($null -ne $p.slide_tackles)) {
+                $tAtt = (ConvertTo-Dbl $p.stand_tackles) + (ConvertTo-Dbl $p.slide_tackles)
+                $tWon = (ConvertTo-Dbl $p.stand_tackles_won) + (ConvertTo-Dbl $p.slide_tackles_won)
+            } else {
+                $tAtt = [double]$pTackles
+                $tWon = ConvertTo-Dbl $p.tackles_completed ([double]$pTackles)
+            }
+            if ($tAtt -gt 0) { $pTacklePct = [Math]::Min(100, [int][Math]::Floor(($tWon / $tAtt) * 100)) } else { $pTacklePct = 0 }
         }
         $pMotmFlag = ([string]$p.man_of_the_match).Trim().ToLower()
         $isMotm = ($pName -eq $topPlayer) -or ($pMotmFlag -eq "true") -or ($pMotmFlag -eq "1")

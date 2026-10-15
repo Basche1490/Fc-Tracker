@@ -2,6 +2,7 @@
 -- Production community snapshot exporter for Project Atlas Tracker.
 -- Read-only; writes one atomic career snapshot to Documents\FC26 Export\Snapshots.
 
+
 local MEMORY = require 'imports/core/memory'
 require 'imports/other/helpers'
 require 'imports/services/enums'
@@ -16,6 +17,9 @@ local LOG_LINES = {}
 local TABLE_CACHE = {}
 local MISSING_FIELD_LOGGED = {}
 local UNAVAILABLE_FIELDS = {}
+-- Current FC26 builds do not expose players.joindate via GetRecordFieldValue.
+-- Live Editor logs a native "no field" error even when Lua receives nil, so
+-- probing this field per player would flood the console. Skip it explicitly.
 local KNOWN_UNAVAILABLE_FIELDS = {
     ["players.joindate"] = true,
 }
@@ -389,6 +393,7 @@ local function get_game_date()
     return date.year or "", date.month or "", date.day or ""
 end
 
+
 local function safe_competition_name(comp_object_id)
     local number = tonumber(comp_object_id)
     if number == nil or number <= 0 then
@@ -408,6 +413,8 @@ local function safe_competition_name(comp_object_id)
     return ""
 end
 
+-- EA career dates are stored as elapsed days since 1582-10-14.
+-- 1970-01-01 is day 141428 in that system.
 local function days_since_1970_to_civil(z)
     z = math.floor(tonumber(z) or 0)
     z = z + 719468
@@ -434,6 +441,7 @@ local function ea_day_to_iso(raw_value)
         return ""
     end
 
+    -- Some match-related structures use YYYYMMDD directly.
     if raw >= 19000101 and raw <= 25001231 then
         local year = raw // 10000
         local month = (raw // 100) % 100
@@ -456,6 +464,7 @@ local function fixture_time_to_text(raw_value)
         return ""
     end
 
+    -- Fixture memory stores time as HHMM (for example 1245 or 2000).
     local hour = raw // 100
     local minute = raw % 100
     if hour > 23 or minute > 59 then
@@ -567,6 +576,7 @@ end
 local function run_export()
     log("FC26 Snapshot v" .. EXPORTER_VERSION .. " started")
     log("Export root: " .. EXPORT_ROOT)
+    log("Config source: " .. EXPORT_CONFIG_SOURCE)
     log("Partial output directory: " .. output_dir)
 
     local leagues_by_id = {}
@@ -619,6 +629,9 @@ local function run_export()
         end
     end
 
+    -- Static competition IDs are the IDs used by EA media files such as l20.png and t20.png.
+    -- Career memory exposes a different competition object ID. The fixtures database table
+    -- provides the crosswalk through fixtureid. Missing tables are tolerated.
     do
         local _, mapping_status = iterate_table("fixtures", function(tbl, record)
             local fixture_id = tonumber(get_field("fixtures", tbl, record, "fixtureid", ""))
@@ -631,9 +644,14 @@ local function run_export()
                 fixture_stadium_id_by_fixture_id[fixture_id] = stadium_id
             end
         end)
+        if mapping_status ~= "ok" then
+            log("Static competition ID crosswalk unavailable: " .. tostring(mapping_status))
+        end
     end
 
+    -- ---------------------------------------------------------------------
     -- Leagues
+    -- ---------------------------------------------------------------------
     do
         local filename = "leagues.csv"
         local file = open_csv(filename, {
@@ -665,9 +683,12 @@ local function run_export()
 
         file:close()
         add_manifest(filename, written, status)
+        log("Exported leagues: " .. written)
     end
 
+    -- ---------------------------------------------------------------------
     -- League/team links
+    -- ---------------------------------------------------------------------
     do
         local filename = "team_leagues.csv"
         local file = open_csv(filename, {
@@ -762,9 +783,12 @@ local function run_export()
 
         file:close()
         add_manifest(filename, written, status)
+        log("Exported team/league links: " .. written)
     end
 
+    -- ---------------------------------------------------------------------
     -- Teams
+    -- ---------------------------------------------------------------------
     do
         local filename = "teams.csv"
         local file = open_csv(filename, {
@@ -822,10 +846,23 @@ local function run_export()
 
         file:close()
         TEAM_PROFITABILITY_EXPORTED = TEAM_PROFITABILITY_NONEMPTY_COUNT > 0
-        add_manifest(filename, written, status)
+        local team_status = status
+        local team_note = "profitability non-empty for "
+            .. tostring(TEAM_PROFITABILITY_NONEMPTY_COUNT)
+            .. " of " .. tostring(TEAM_PROFITABILITY_TOTAL_TEAMS) .. " teams"
+        if not TEAM_PROFITABILITY_EXPORTED then
+            team_status = "warning"
+            team_note = team_note .. "; teams.profitability unavailable or empty"
+            log("WARNING: No team profitability values were exported")
+        end
+        add_manifest(filename, written, team_status, team_note)
+        log("Exported teams: " .. written
+            .. "; profitability values: " .. TEAM_PROFITABILITY_NONEMPTY_COUNT)
     end
 
-    -- Career metadata
+    -- ---------------------------------------------------------------------
+    -- Career metadata / user club / deterministic identity candidate
+    -- ---------------------------------------------------------------------
     local managed_team_id = 0
     local season_count = ""
     local user_display_name = ""
@@ -861,6 +898,7 @@ local function run_export()
             local season = tonumber(get_field("career_managerhistory", tbl, record, "season", 0)) or 0
             local team_id = tonumber(get_field("career_managerhistory", tbl, record, "teamid", 0)) or 0
             local league_id = tonumber(get_field("career_managerhistory", tbl, record, "leagueid", 0)) or 0
+            local games_played = tonumber(get_field("career_managerhistory", tbl, record, "games_played", 0)) or 0
             if season > 0 and team_id > 0 and (earliest_season == nil or season < earliest_season) then
                 earliest_season = season
                 initial_team_id = team_id
@@ -899,7 +937,10 @@ local function run_export()
             exported_at_local = now_iso_local(),
             exported_at_utc = now_iso_utc(),
             export_root = EXPORT_ROOT,
+            export_config_source = EXPORT_CONFIG_SOURCE,
             career_fingerprint_candidate = career_fingerprint_candidate,
+            career_identity_basis = identity_basis,
+            career_identity_confidence = "stable_candidate_v2_not_save_guid",
             user_id = user_id,
             manager_display_name = user_display_name,
             manager_nationality_id = manager_nationality_id,
@@ -913,7 +954,9 @@ local function run_export()
             career_date_iso = career_date_iso,
             career_date_sort = career_date_sort,
             managed_completed_fixture_count = 0,
-            global_completed_fixture_count = 0
+            global_completed_fixture_count = 0,
+            detailed_player_match_stats = false,
+            match_events = false
         }
 
         local filename = "career_metadata.csv"
@@ -925,16 +968,557 @@ local function run_export()
             {"snapshot_id", SNAPSHOT_ID},
             {"exported_at_local", SNAPSHOT_CONTEXT.exported_at_local},
             {"exported_at_utc", SNAPSHOT_CONTEXT.exported_at_utc},
+            {"export_trigger", tostring(_G.FC26_EXPORT_EXPORT_TRIGGER or "")},
+            {"post_match_capture_id", tostring(_G.FC26_EXPORT_POST_MATCH_CAPTURE_ID or "")},
+            {"export_scope", "current_loaded_career"},
+            {"export_root", EXPORT_ROOT},
+            {"export_config_source", EXPORT_CONFIG_SOURCE},
+            {"export_root_is_fallback", 0},
+            {"career_fingerprint_candidate", career_fingerprint_candidate},
+            {"career_identity_confidence", "stable_candidate_v2_not_save_guid"},
             {"career_date", career_date_iso},
+            {"career_date_sort", career_date_sort},
+            {"season_index", SNAPSHOT_CONTEXT.season_index},
+            {"managed_team_source", "career_users.clubteamid"},
             {"managed_team_id", managed_team_id},
-            {"managed_team_name", SNAPSHOT_CONTEXT.managed_team_name}
+            {"managed_team_name", SNAPSHOT_CONTEXT.managed_team_name},
+            {"initial_team_id", initial_team_id},
+            {"initial_team_name", SNAPSHOT_CONTEXT.initial_team_name},
+            {"manager_display_name", user_display_name},
+            {"manager_nationality_id", manager_nationality_id},
+            {"primary_compobjid", primary_compobjid},
+            {"team_profitability_source", "teams.profitability"},
+            {"team_profitability_exported", TEAM_PROFITABILITY_EXPORTED and 1 or 0},
+            {"team_profitability_nonempty_count", TEAM_PROFITABILITY_NONEMPTY_COUNT},
+            {"team_profitability_total_teams", TEAM_PROFITABILITY_TOTAL_TEAMS}
         }
-        for i = 1, #metadata do write_csv_row(file, metadata[i]) end
+
+        for i = 1, #metadata do
+            write_csv_row(file, metadata[i])
+        end
+
         file:close()
         add_manifest(filename, #metadata, user_status)
+        log("Exported career metadata; managed team: " .. tostring(SNAPSHOT_CONTEXT.managed_team_name))
     end
 
-    -- Fixtures from Live Editor memory
+    -- ---------------------------------------------------------------------
+    -- Players with resolved names
+    -- ---------------------------------------------------------------------
+    local unresolved_names = {}
+    do
+        local filename = "players.csv"
+        local file = open_csv(filename, {
+            "player_id", "display_name", "team_id", "team_name",
+            "overall", "potential", "primary_position_id", "primary_position",
+            "position_2_id", "position_2", "position_3_id", "position_3",
+            "position_4_id", "position_4", "nationality_id", "birthdate_raw",
+            "contract_valid_until", "player_join_team_date_raw", "player_join_team_date",
+            "height", "weight", "preferred_foot_id",
+            "weak_foot", "skill_moves", "international_reputation", "is_retiring",
+            "gender", "firstname_id", "lastname_id", "commonname_id",
+            "jersey_name_id", "pacdiv", "shohan", "paskic", "driref", "defspe",
+            "phypos", "acceleration", "sprint_speed", "agility", "balance",
+            "reactions", "ball_control", "dribbling", "finishing", "shot_power",
+            "long_shots", "volleys", "penalties", "positioning", "vision",
+            "crossing", "free_kick_accuracy", "short_passing", "long_passing",
+            "curve", "interceptions", "heading_accuracy", "defensive_awareness",
+            "standing_tackle", "sliding_tackle", "jumping", "stamina", "strength",
+            "aggression", "composure", "gk_diving", "gk_handling", "gk_kicking",
+            "gk_reflexes", "gk_positioning"
+        })
+
+        local written = 0
+        local _, status = iterate_table("players", function(tbl, record)
+            local player_id = get_field("players", tbl, record, "playerid", 0)
+            if is_positive_id(player_id) then
+                local display_name = safe_player_name(player_id)
+                if display_name == "" then
+                    table.insert(unresolved_names, player_id)
+                end
+
+                local team_id = safe_player_team_id(player_id)
+                local team = teams_by_id[tonumber(team_id)]
+                local primary_position_id = get_field("players", tbl, record, "preferredposition1", "")
+                local position_2_id = get_field("players", tbl, record, "preferredposition2", "")
+                local position_3_id = get_field("players", tbl, record, "preferredposition3", "")
+                local position_4_id = get_field("players", tbl, record, "preferredposition4", "")
+
+                local player = {
+                    player_id = player_id,
+                    display_name = display_name,
+                    team_id = team_id,
+                    team_name = team and team.team_name or safe_team_name(team_id),
+                    overall = get_field("players", tbl, record, "overallrating", ""),
+                    potential = get_field("players", tbl, record, "potential", ""),
+                    primary_position_id = primary_position_id,
+                    primary_position = safe_football_position_name(primary_position_id)
+                }
+                players_by_id[tonumber(player_id)] = player
+
+                local join_raw = get_field("players", tbl, record, "joindate", "")
+                write_csv_row(file, {
+                    player.player_id, player.display_name, player.team_id, player.team_name,
+                    player.overall, player.potential,
+                    primary_position_id, player.primary_position,
+                    position_2_id, safe_football_position_name(position_2_id),
+                    position_3_id, safe_football_position_name(position_3_id),
+                    position_4_id, safe_football_position_name(position_4_id),
+                    get_field("players", tbl, record, "nationality", ""),
+                    get_field("players", tbl, record, "birthdate", ""),
+                    get_field("players", tbl, record, "contractvaliduntil", ""),
+                    join_raw,
+                    ea_day_to_iso(join_raw),
+                    get_field("players", tbl, record, "height", ""),
+                    get_field("players", tbl, record, "weight", ""),
+                    get_field("players", tbl, record, "preferredfoot", ""),
+                    get_field("players", tbl, record, "weakfootabilitytypecode", ""),
+                    get_field("players", tbl, record, "skillmoves", ""),
+                    get_field("players", tbl, record, "internationalrep", ""),
+                    get_field("players", tbl, record, "isretiring", ""),
+                    get_field("players", tbl, record, "gender", ""),
+                    get_field("players", tbl, record, "firstnameid", ""),
+                    get_field("players", tbl, record, "lastnameid", ""),
+                    get_field("players", tbl, record, "commonnameid", ""),
+                    get_field("players", tbl, record, "playerjerseynameid", ""),
+                    get_field("players", tbl, record, "pacdiv", ""),
+                    get_field("players", tbl, record, "shohan", ""),
+                    get_field("players", tbl, record, "paskic", ""),
+                    get_field("players", tbl, record, "driref", ""),
+                    get_field("players", tbl, record, "defspe", ""),
+                    get_field("players", tbl, record, "phypos", ""),
+                    get_field("players", tbl, record, "acceleration", ""),
+                    get_field("players", tbl, record, "sprintspeed", ""),
+                    get_field("players", tbl, record, "agility", ""),
+                    get_field("players", tbl, record, "balance", ""),
+                    get_field("players", tbl, record, "reactions", ""),
+                    get_field("players", tbl, record, "ballcontrol", ""),
+                    get_field("players", tbl, record, "dribbling", ""),
+                    get_field("players", tbl, record, "finishing", ""),
+                    get_field("players", tbl, record, "shotpower", ""),
+                    get_field("players", tbl, record, "longshots", ""),
+                    get_field("players", tbl, record, "volleys", ""),
+                    get_field("players", tbl, record, "penalties", ""),
+                    get_field("players", tbl, record, "positioning", ""),
+                    get_field("players", tbl, record, "vision", ""),
+                    get_field("players", tbl, record, "crossing", ""),
+                    get_field("players", tbl, record, "freekickaccuracy", ""),
+                    get_field("players", tbl, record, "shortpassing", ""),
+                    get_field("players", tbl, record, "longpassing", ""),
+                    get_field("players", tbl, record, "curve", ""),
+                    get_field("players", tbl, record, "interceptions", ""),
+                    get_field("players", tbl, record, "headingaccuracy", ""),
+                    get_field("players", tbl, record, "defensiveawareness", ""),
+                    get_field("players", tbl, record, "standingtackle", ""),
+                    get_field("players", tbl, record, "slidingtackle", ""),
+                    get_field("players", tbl, record, "jumping", ""),
+                    get_field("players", tbl, record, "stamina", ""),
+                    get_field("players", tbl, record, "strength", ""),
+                    get_field("players", tbl, record, "aggression", ""),
+                    get_field("players", tbl, record, "composure", ""),
+                    get_field("players", tbl, record, "gkdiving", ""),
+                    get_field("players", tbl, record, "gkhandling", ""),
+                    get_field("players", tbl, record, "gkkicking", ""),
+                    get_field("players", tbl, record, "gkreflexes", ""),
+                    get_field("players", tbl, record, "gkpositioning", "")
+                })
+
+                written = written + 1
+                if written % 1000 == 0 then
+                    log("Players processed: " .. written)
+                end
+            end
+        end)
+
+        file:close()
+        local player_status = status
+        local note = ""
+        if #unresolved_names > 0 then
+            player_status = "warning"
+            note = tostring(#unresolved_names) .. " unresolved player names"
+        end
+        add_manifest(filename, written, player_status, note)
+        log("Exported players: " .. written .. "; unresolved names: " .. #unresolved_names)
+    end
+
+    do
+        local filename = "unresolved_player_names.csv"
+        local file = open_csv(filename, {"player_id", "reason"})
+        for i = 1, #unresolved_names do
+            write_csv_row(file, {unresolved_names[i], "GetPlayerName returned an empty value"})
+        end
+        file:close()
+        add_manifest(filename, #unresolved_names, #unresolved_names == 0 and "ok" or "warning")
+    end
+
+    -- ---------------------------------------------------------------------
+    -- Roster links
+    -- ---------------------------------------------------------------------
+    do
+        local filename = "rosters.csv"
+        local file = open_csv(filename, {
+            "player_id", "display_name", "team_id", "team_name", "jersey_number",
+            "teamsheet_slot_raw", "teamsheet_slot_label", "primary_position_id",
+            "primary_position", "form", "injury"
+        })
+
+        local written = 0
+        local _, status = iterate_table("teamplayerlinks", function(tbl, record)
+            local player_id = get_field("teamplayerlinks", tbl, record, "playerid", 0)
+            local team_id = get_field("teamplayerlinks", tbl, record, "teamid", 0)
+            if is_positive_id(player_id) and is_positive_id(team_id) then
+                local player = players_by_id[tonumber(player_id)]
+                local team = teams_by_id[tonumber(team_id)]
+                write_csv_row(file, {
+                    player_id,
+                    player and player.display_name or safe_player_name(player_id),
+                    team_id,
+                    team and team.team_name or safe_team_name(team_id),
+                    get_field("teamplayerlinks", tbl, record, "jerseynumber", ""),
+                    get_field("teamplayerlinks", tbl, record, "position", ""),
+                    teamsheet_slot_label(get_field("teamplayerlinks", tbl, record, "position", "")),
+                    player and player.primary_position_id or "",
+                    player and player.primary_position or "",
+                    get_field("teamplayerlinks", tbl, record, "form", ""),
+                    get_field("teamplayerlinks", tbl, record, "injury", "")
+                })
+                written = written + 1
+            end
+        end)
+
+        file:close()
+        add_manifest(filename, written, status, "Season statistics intentionally excluded; use season_stats.csv")
+        log("Exported roster links: " .. written)
+    end
+
+    -- ---------------------------------------------------------------------
+    -- Loans
+    -- ---------------------------------------------------------------------
+    do
+        local filename = "loans.csv"
+        local file = open_csv(filename, {
+            "player_id", "display_name", "parent_team_id", "parent_team_name",
+            "loan_team_id", "loan_team_name", "loan_end_raw", "loan_end_date",
+            "is_loan_to_buy"
+        })
+
+        local written = 0
+        local _, status = iterate_table("playerloans", function(tbl, record)
+            local player_id = get_field("playerloans", tbl, record, "playerid", 0)
+            if is_positive_id(player_id) then
+                local parent_team_id = get_field("playerloans", tbl, record, "teamidloanedfrom", 0)
+                local player = players_by_id[tonumber(player_id)]
+                local loan_team_id = player and player.team_id or safe_player_team_id(player_id)
+                local parent_team = teams_by_id[tonumber(parent_team_id)]
+                local loan_team = teams_by_id[tonumber(loan_team_id)]
+                local loan_end_raw = get_field("playerloans", tbl, record, "loandateend", "")
+                write_csv_row(file, {
+                    player_id,
+                    player and player.display_name or safe_player_name(player_id),
+                    parent_team_id,
+                    parent_team and parent_team.team_name or safe_team_name(parent_team_id),
+                    loan_team_id,
+                    loan_team and loan_team.team_name or safe_team_name(loan_team_id),
+                    loan_end_raw,
+                    ea_day_to_iso(loan_end_raw),
+                    get_field("playerloans", tbl, record, "isloantobuy", "")
+                })
+                written = written + 1
+            end
+        end)
+
+        file:close()
+        add_manifest(filename, written, status)
+        log("Exported loans: " .. written)
+    end
+
+    -- ---------------------------------------------------------------------
+    -- Detailed career contracts
+    -- ---------------------------------------------------------------------
+    do
+        local filename = "contracts.csv"
+        local file = open_csv(filename, {
+            "player_id", "display_name", "team_id", "team_name", "duration_months",
+            "contract_status", "player_role", "wage", "contract_date",
+            "last_status_change_date", "loan_wage_split", "signon_bonus",
+            "performance_bonus_type", "performance_bonus_value",
+            "performance_bonus_count", "performance_bonus_count_achieved",
+            "is_performance_bonus_achieved"
+        })
+
+        local written = 0
+        local _, status = iterate_table("career_playercontract", function(tbl, record)
+            local player_id = get_field("career_playercontract", tbl, record, "playerid", 0)
+            if is_positive_id(player_id) then
+                local team_id = get_field("career_playercontract", tbl, record, "teamid", 0)
+                local player = players_by_id[tonumber(player_id)]
+                local team = teams_by_id[tonumber(team_id)]
+                write_csv_row(file, {
+                    player_id,
+                    player and player.display_name or safe_player_name(player_id),
+                    team_id,
+                    team and team.team_name or safe_team_name(team_id),
+                    get_field("career_playercontract", tbl, record, "duration_months", ""),
+                    get_field("career_playercontract", tbl, record, "contract_status", ""),
+                    get_field("career_playercontract", tbl, record, "playerrole", ""),
+                    get_field("career_playercontract", tbl, record, "wage", ""),
+                    get_field("career_playercontract", tbl, record, "contract_date", ""),
+                    get_field("career_playercontract", tbl, record, "last_status_change_date", ""),
+                    get_field("career_playercontract", tbl, record, "loan_wage_split", ""),
+                    get_field("career_playercontract", tbl, record, "signon_bonus", ""),
+                    get_field("career_playercontract", tbl, record, "performancebonustype", ""),
+                    get_field("career_playercontract", tbl, record, "performancebonusvalue", ""),
+                    get_field("career_playercontract", tbl, record, "performancebonuscount", ""),
+                    get_field("career_playercontract", tbl, record, "performancebonuscountachieved", ""),
+                    get_field("career_playercontract", tbl, record, "isperformancebonusachieved", "")
+                })
+                written = written + 1
+            end
+        end)
+
+        file:close()
+        add_manifest(filename, written, status)
+        log("Exported detailed contracts: " .. written)
+    end
+
+    -- ---------------------------------------------------------------------
+    -- Youth academy
+    -- ---------------------------------------------------------------------
+    do
+        local filename = "youth_players.csv"
+        local file = open_csv(filename, {
+            "player_id", "display_name", "overall", "potential", "primary_position_id",
+            "primary_position", "player_tier", "months_in_squad",
+            "potential_variance", "swing_low_potential"
+        })
+
+        local written = 0
+        local _, status = iterate_table("career_youthplayers", function(tbl, record)
+            local player_id = get_field("career_youthplayers", tbl, record, "playerid", 0)
+            if is_positive_id(player_id) then
+                local player = players_by_id[tonumber(player_id)]
+                write_csv_row(file, {
+                    player_id,
+                    player and player.display_name or safe_player_name(player_id),
+                    player and player.overall or "",
+                    player and player.potential or "",
+                    player and player.primary_position_id or "",
+                    player and player.primary_position or "",
+                    get_field("career_youthplayers", tbl, record, "playertier", ""),
+                    get_field("career_youthplayers", tbl, record, "monthsinsquad", ""),
+                    get_field("career_youthplayers", tbl, record, "potentialvariance", ""),
+                    get_field("career_youthplayers", tbl, record, "swinglowpotential", "")
+                })
+                written = written + 1
+            end
+        end)
+
+        file:close()
+        add_manifest(filename, written, status)
+        log("Exported youth players: " .. written)
+    end
+
+    -- ---------------------------------------------------------------------
+    -- Match rating history
+    -- ---------------------------------------------------------------------
+    do
+        local filename = "match_ratings.csv"
+        local file = open_csv(filename, {
+            "player_id", "display_name", "date_raw", "date", "rating",
+            "minutes_played", "rating_position_raw", "rating_position_hint",
+            "artificial_key"
+        })
+
+        local written = 0
+        local _, status = iterate_table("career_playermatchratinghistory", function(tbl, record)
+            local player_id = get_field("career_playermatchratinghistory", tbl, record, "playerid", 0)
+            if is_positive_id(player_id) then
+                local player = players_by_id[tonumber(player_id)]
+                local position_id = get_field("career_playermatchratinghistory", tbl, record, "position", "")
+                local date_raw = get_field("career_playermatchratinghistory", tbl, record, "date", "")
+                local row = {
+                    player_id = player_id,
+                    display_name = player and player.display_name or safe_player_name(player_id),
+                    date_raw = date_raw,
+                    date = ea_day_to_iso(date_raw),
+                    rating = get_field("career_playermatchratinghistory", tbl, record, "rating", ""),
+                    minutes_played = get_field("career_playermatchratinghistory", tbl, record, "minsplayed", ""),
+                    position_id = position_id,
+                    position = safe_football_position_name(position_id),
+                    artificial_key = get_field("career_playermatchratinghistory", tbl, record, "artificialkey", "")
+                }
+                table.insert(match_rating_rows, row)
+                write_csv_row(file, {
+                    row.player_id, row.display_name, row.date_raw, row.date,
+                    row.rating, row.minutes_played, row.position_id, row.position,
+                    row.artificial_key
+                })
+                written = written + 1
+            end
+        end)
+
+        file:close()
+        add_manifest(filename, written, status)
+        log("Exported match rating history: " .. written)
+    end
+
+    -- ---------------------------------------------------------------------
+    -- Last-match player state retained by the career database
+    -- ---------------------------------------------------------------------
+    do
+        local filename = "last_match_players.csv"
+        local file = open_csv(filename, {
+            "player_id", "display_name", "team_id", "team_name",
+            "is_managed_team", "minutes_played", "actual_position_id",
+            "actual_position", "player_overall", "player_fact_raw", "artificial_key"
+        })
+
+        local written = 0
+        local _, status = iterate_table("career_playerlastmatchhistory", function(tbl, record)
+            local player_id = get_field("career_playerlastmatchhistory", tbl, record, "playerid", 0)
+            local team_id = get_field("career_playerlastmatchhistory", tbl, record, "teamid", 0)
+            if is_positive_id(player_id) and is_positive_id(team_id) then
+                local player = players_by_id[tonumber(player_id)]
+                local team = teams_by_id[tonumber(team_id)]
+                local position_id = get_field("career_playerlastmatchhistory", tbl, record, "position", "")
+                if tonumber(team_id) == tonumber(managed_team_id) then
+                    managed_last_match_positions[tonumber(player_id)] = {
+                        position_id = position_id,
+                        position = safe_football_position_name(position_id)
+                    }
+                end
+                write_csv_row(file, {
+                    player_id,
+                    player and player.display_name or safe_player_name(player_id),
+                    team_id,
+                    team and team.team_name or safe_team_name(team_id),
+                    tonumber(team_id) == tonumber(managed_team_id) and 1 or 0,
+                    get_field("career_playerlastmatchhistory", tbl, record, "minsplayed", ""),
+                    position_id,
+                    safe_football_position_name(position_id),
+                    get_field("career_playerlastmatchhistory", tbl, record, "playeroverall", ""),
+                    get_field("career_playerlastmatchhistory", tbl, record, "playerfact", ""),
+                    get_field("career_playerlastmatchhistory", tbl, record, "artificialkey", "")
+                })
+                written = written + 1
+            end
+        end)
+
+        file:close()
+        add_manifest(filename, written, status, "Contains retained last-match state for many teams; use is_managed_team to filter the current user club")
+        log("Exported last-match player state: " .. written)
+    end
+
+    -- ---------------------------------------------------------------------
+    -- Player development snapshot
+    -- ---------------------------------------------------------------------
+    do
+        local filename = "player_growth.csv"
+        local columns = {
+            "player_id", "display_name", "curve", "overall", "acceleration",
+            "sprint_speed", "agility", "balance", "reactions", "ball_control",
+            "dribbling", "finishing", "shot_power", "long_shots", "volleys",
+            "penalties", "positioning", "vision", "crossing", "free_kick_accuracy",
+            "short_passing", "long_passing", "interceptions", "heading_accuracy",
+            "defensive_awareness", "standing_tackle", "sliding_tackle", "jumping",
+            "stamina", "strength", "aggression", "composure", "gk_diving",
+            "gk_handling", "gk_kicking", "gk_reflexes", "gk_positioning"
+        }
+        local file = open_csv(filename, columns)
+
+        local written = 0
+        local _, status = iterate_table("career_playergrowthuserseason", function(tbl, record)
+            local player_id = get_field("career_playergrowthuserseason", tbl, record, "playerid", 0)
+            if is_positive_id(player_id) then
+                local player = players_by_id[tonumber(player_id)]
+                write_csv_row(file, {
+                    player_id,
+                    player and player.display_name or safe_player_name(player_id),
+                    get_field("career_playergrowthuserseason", tbl, record, "curve", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "overall", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "acceleration", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "sprintspeed", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "agility", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "balance", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "reactions", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "ballcontrol", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "dribbling", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "finishing", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "shotpower", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "longshots", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "volleys", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "penalties", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "positioning", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "vision", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "crossing", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "freekickaccuracy", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "shortpassing", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "longpassing", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "interceptions", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "headingaccuracy", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "defensiveawareness", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "standingtackle", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "slidingtackle", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "jumping", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "stamina", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "strength", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "aggression", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "composure", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "gkdiving", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "gkhandling", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "gkkicking", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "gkreflexes", ""),
+                    get_field("career_playergrowthuserseason", tbl, record, "gkpositioning", "")
+                })
+                written = written + 1
+            end
+        end)
+
+        file:close()
+        add_manifest(filename, written, status)
+        log("Exported player growth rows: " .. written)
+    end
+
+    -- ---------------------------------------------------------------------
+    -- Player awards
+    -- ---------------------------------------------------------------------
+    do
+        local filename = "player_awards.csv"
+        local file = open_csv(filename, {
+            "player_id", "display_name", "team_id", "team_name", "season",
+            "award_type_id", "count", "artificial_key"
+        })
+
+        local written = 0
+        local _, status = iterate_table("career_playerawards", function(tbl, record)
+            local player_id = get_field("career_playerawards", tbl, record, "playerid", 0)
+            local team_id = get_field("career_playerawards", tbl, record, "teamid", 0)
+            if is_positive_id(player_id) then
+                local player = players_by_id[tonumber(player_id)]
+                local team = teams_by_id[tonumber(team_id)]
+                write_csv_row(file, {
+                    player_id,
+                    player and player.display_name or safe_player_name(player_id),
+                    team_id,
+                    team and team.team_name or safe_team_name(team_id),
+                    get_field("career_playerawards", tbl, record, "season", ""),
+                    get_field("career_playerawards", tbl, record, "typeid", ""),
+                    get_field("career_playerawards", tbl, record, "count", ""),
+                    get_field("career_playerawards", tbl, record, "artificialkey", "")
+                })
+                written = written + 1
+            end
+        end)
+
+        file:close()
+        add_manifest(filename, written, status)
+        log("Exported player awards: " .. written)
+    end
+
+    -- ---------------------------------------------------------------------
+    -- Fixtures and results from Live Editor memory
+    -- Based on the official FC 26 Live Editor export_fixtures.lua structure.
+    -- ---------------------------------------------------------------------
     do
         local filename = "fixtures.csv"
         local file = open_csv(filename, {
@@ -1036,11 +1620,21 @@ local function run_export()
             end
         end)
 
+        if not ok_read then
+            status = "warning"
+            note = "Fixture memory export unavailable: " .. tostring(result_or_error)
+            log(note)
+        end
+
         file:close()
         add_manifest(filename, written, status, note)
+        log("Exported fixtures/results: " .. written)
     end
 
-    -- Managed Team Matches
+    -- ---------------------------------------------------------------------
+    -- Current managed team's fixtures. The team is discovered dynamically
+    -- from career_users.clubteamid; no club ID or name is hard-coded.
+    -- ---------------------------------------------------------------------
     do
         local filename = "managed_team_matches.csv"
         local file = open_csv(filename, {
@@ -1084,10 +1678,261 @@ local function run_export()
             })
         end
         file:close()
-        add_manifest(filename, #managed_team_fixtures, "ok")
+        add_manifest(filename, #managed_team_fixtures, "ok", "Current user club selected dynamically from career_users.clubteamid")
+        log("Exported current managed-team matches: " .. #managed_team_fixtures)
     end
 
-    -- Manifest
+    -- ---------------------------------------------------------------------
+    -- Enrich rating history with the current managed team's fixture context.
+    -- The source rating table has no fixture/team ID, so joining is by date.
+    -- ---------------------------------------------------------------------
+    do
+        local filename = "managed_team_match_players.csv"
+        local file = open_csv(filename, {
+            "join_status", "managed_team_id", "managed_team_name", "fixture_key",
+            "competition_object_id", "competition_name", "date_raw", "date",
+            "side", "opponent_team_id", "opponent_team_name", "home_score",
+            "away_score", "result", "player_id", "display_name", "rating",
+            "minutes_played", "rating_position_raw", "rating_position_hint",
+            "actual_position_id", "actual_position", "actual_position_source",
+            "rating_artificial_key"
+        })
+
+        local managed_team_name = safe_team_name(managed_team_id)
+        local written = 0
+        local joined = 0
+        local duplicate_rows_skipped = 0
+        local seen_fixture_players = {}
+        for i = 1, #match_rating_rows do
+            local rating = match_rating_rows[i]
+            local candidates = managed_team_fixtures_by_date[tostring(rating.date_raw)] or {}
+            local fixture = nil
+            local join_status = "unmatched_date"
+            if #candidates == 1 then
+                fixture = candidates[1]
+                join_status = "joined_by_date"
+            elseif #candidates > 1 then
+                join_status = "ambiguous_date"
+            end
+
+            local should_write = true
+            if fixture then
+                local dedupe_key = tostring(fixture.fixture_key or rating.date_raw) .. ":" .. tostring(rating.player_id)
+                if seen_fixture_players[dedupe_key] then
+                    should_write = false
+                    duplicate_rows_skipped = duplicate_rows_skipped + 1
+                else
+                    seen_fixture_players[dedupe_key] = true
+                    joined = joined + 1
+                end
+            end
+
+            if should_write then
+                local actual_position_id = ""
+                local actual_position = ""
+                local actual_position_source = ""
+                if fixture and tonumber(fixture.date_raw) == tonumber(latest_managed_completed_date_raw) then
+                    local actual = managed_last_match_positions[tonumber(rating.player_id)]
+                    if actual then
+                        actual_position_id = actual.position_id or ""
+                        actual_position = actual.position or ""
+                        actual_position_source = "career_playerlastmatchhistory_latest_match"
+                    end
+                end
+
+                write_csv_row(file, {
+                    join_status,
+                    managed_team_id,
+                    managed_team_name,
+                    fixture and fixture.fixture_key or "",
+                    fixture and fixture.competition_object_id or "",
+                    fixture and fixture.competition_name or "",
+                    rating.date_raw,
+                    rating.date,
+                    fixture and fixture.managed_team_side or "",
+                    fixture and fixture.opponent_team_id or "",
+                    fixture and fixture.opponent_team_name or "",
+                    fixture and fixture.home_score or "",
+                    fixture and fixture.away_score or "",
+                    fixture and fixture.managed_team_result or "",
+                    rating.player_id,
+                    rating.display_name,
+                    rating.rating,
+                    rating.minutes_played,
+                    rating.position_id,
+                    rating.position,
+                    actual_position_id,
+                    actual_position,
+                    actual_position_source,
+                    rating.artificial_key
+                })
+                written = written + 1
+            end
+        end
+
+        file:close()
+        add_manifest(filename, written, "ok", tostring(joined) .. " rows joined to the current managed club by match date; " .. tostring(duplicate_rows_skipped) .. " duplicate player/fixture rows suppressed")
+        log("Exported enriched managed-team match player rows: " .. written .. "; joined: " .. joined .. "; duplicate rows suppressed: " .. duplicate_rows_skipped)
+    end
+
+    -- ---------------------------------------------------------------------
+    -- Competition progress
+    -- ---------------------------------------------------------------------
+    do
+        local filename = "competition_progress.csv"
+        local file = open_csv(filename, {
+            "team_id", "team_name", "season", "competition_object_id",
+            "competition_name", "competition_short_name", "stage_id", "cup_objective_result",
+            "has_team_won", "artificial_key"
+        })
+
+        local written = 0
+        local _, status = iterate_table("career_competitionprogress", function(tbl, record)
+            local team_id = get_field("career_competitionprogress", tbl, record, "teamid", 0)
+            if is_positive_id(team_id) then
+                local team = teams_by_id[tonumber(team_id)]
+                local comp_object_id = get_field("career_competitionprogress", tbl, record, "compobjid", "")
+                local short_name = get_field("career_competitionprogress", tbl, record, "compshortname", "")
+                local competition_name = safe_competition_name(comp_object_id)
+                if competition_name == "" then
+                    competition_name = short_name
+                end
+                register_competition(comp_object_id, "competition_progress", competition_name)
+                write_csv_row(file, {
+                    team_id,
+                    team and team.team_name or safe_team_name(team_id),
+                    get_field("career_competitionprogress", tbl, record, "season", ""),
+                    comp_object_id,
+                    competition_name,
+                    short_name,
+                    get_field("career_competitionprogress", tbl, record, "stageid", ""),
+                    get_field("career_competitionprogress", tbl, record, "cup_objective_result", ""),
+                    get_field("career_competitionprogress", tbl, record, "hasteamwon", ""),
+                    get_field("career_competitionprogress", tbl, record, "artificialkey", "")
+                })
+                written = written + 1
+            end
+        end)
+
+        file:close()
+        add_manifest(filename, written, status)
+        log("Exported competition progress: " .. written)
+    end
+
+    -- ---------------------------------------------------------------------
+    -- Current-season statistics through the Live Editor helper API
+    -- ---------------------------------------------------------------------
+    do
+        local filename = "season_stats.csv"
+        local file = open_csv(filename, {
+            "player_id", "display_name", "represented_team_id", "represented_team_name",
+            "current_club_id", "current_club_name", "position",
+            "competition_object_id", "competition_name", "appearances",
+            "average_rating", "man_of_the_match", "goals", "assists",
+            "yellow_cards", "second_yellow_cards", "red_cards", "saves",
+            "goals_conceded", "clean_sheets"
+        })
+
+        local written = 0
+        local manifest_status = "ok"
+        local manifest_note = "represented_team_id comes from GetPlayersStats; current_club_id comes from the current career database"
+        local ok_stats, stats_or_error = pcall(function()
+            return GetPlayersStats()
+        end)
+
+        if ok_stats and stats_or_error ~= nil then
+            all_player_stats = stats_or_error
+            for i = 1, #all_player_stats do
+                local stat = all_player_stats[i]
+                local player_id = stat.playerid
+                local appearances = stat.app or 0
+                if is_positive_id(player_id) and tonumber(appearances) and tonumber(appearances) > 0 then
+                    local player = players_by_id[tonumber(player_id)]
+                    local current_club_id = player and player.team_id or safe_player_team_id(player_id)
+                    local current_club = teams_by_id[tonumber(current_club_id)]
+                    local represented_team_id = tonumber(stat.teamid) or 0
+                    local avg = tonumber(stat.avg) or 0
+                    avg = (avg / tonumber(appearances)) / 10
+                    local competition_name = stat.compname or safe_competition_name(stat.compobjid)
+                    register_competition(stat.compobjid, "season_stats", competition_name)
+
+                    write_csv_row(file, {
+                        player_id,
+                        player and player.display_name or safe_player_name(player_id),
+                        is_positive_id(represented_team_id) and represented_team_id or "",
+                        is_positive_id(represented_team_id) and safe_team_name(represented_team_id) or "",
+                        current_club_id,
+                        current_club and current_club.team_name or safe_team_name(current_club_id),
+                        player and player.primary_position or "",
+                        stat.compobjid or "",
+                        competition_name or "",
+                        appearances,
+                        string.format("%.2f", avg),
+                        stat.motm or 0,
+                        stat.goals or 0,
+                        stat.assists or 0,
+                        stat.yellow or 0,
+                        stat.two_yellow or 0,
+                        stat.red or 0,
+                        stat.saves or 0,
+                        stat.goals_conceded or 0,
+                        stat.clean_sheets or 0
+                    })
+                    written = written + 1
+                end
+            end
+        else
+            log("GetPlayersStats unavailable: " .. tostring(stats_or_error))
+            manifest_status = "warning"
+            manifest_note = "GetPlayersStats unavailable"
+        end
+
+        -- Close before measuring the file for manifest.json. On Windows a still-open
+        -- binary stream may not have flushed its final buffer yet.
+        file:close()
+        add_manifest(filename, written, manifest_status, manifest_note)
+        log("Exported current-season stats: " .. written)
+    end
+
+    -- ---------------------------------------------------------------------
+    -- Competition reference assembled from every current source
+    -- ---------------------------------------------------------------------
+    do
+        local filename = "competitions.csv"
+        local file = open_csv(filename, {
+            "competition_object_id", "competition_id", "competition_name", "sources"
+        })
+        local ids = {}
+        for comp_object_id, _ in pairs(competitions_by_object_id) do
+            table.insert(ids, comp_object_id)
+        end
+        table.sort(ids)
+
+        for i = 1, #ids do
+            local item = competitions_by_object_id[ids[i]]
+            local sources = {}
+            for source, _ in pairs(item.sources) do
+                table.insert(sources, source)
+            end
+            table.sort(sources)
+            write_csv_row(file, {
+                item.competition_object_id,
+                item.competition_id or "",
+                item.competition_name or safe_competition_name(item.competition_object_id),
+                table.concat(sources, ";")
+            })
+        end
+        file:close()
+        add_manifest(filename, #ids, "ok")
+        log("Exported competition references: " .. #ids)
+    end
+
+    -- ---------------------------------------------------------------------
+    -- Manifest, log and atomic hot-folder finalization
+    -- ---------------------------------------------------------------------
+    SNAPSHOT_CONTEXT.managed_completed_fixture_count = managed_completed_fixture_count
+    SNAPSHOT_CONTEXT.global_completed_fixture_count = global_completed_fixture_count
+
     do
         local filename = "manifest.csv"
         local file = open_csv(filename, {"file", "row_count", "status", "note", "byte_size"})
@@ -1097,12 +1942,99 @@ local function run_export()
         file:close()
     end
 
+    do
+        local path = output_dir .. "\\manifest.json"
+        local file, err = io.open(path, "wb")
+        if not file then
+            error("Could not create manifest.json: " .. tostring(err))
+        end
+
+        file:write("{\r\n")
+        file:write('  "schemaVersion": ' .. json_string(SCHEMA_VERSION) .. ",\r\n")
+        file:write('  "exporterVersion": ' .. json_string(EXPORTER_VERSION) .. ",\r\n")
+        file:write('  "game": "EA SPORTS FC 26",\r\n')
+        file:write('  "snapshotId": ' .. json_string(SNAPSHOT_CONTEXT.snapshot_id) .. ",\r\n")
+        file:write('  "status": "complete",\r\n')
+        file:write('  "exportedAtLocal": ' .. json_string(SNAPSHOT_CONTEXT.exported_at_local) .. ",\r\n")
+        file:write('  "exportedAtUtc": ' .. json_string(SNAPSHOT_CONTEXT.exported_at_utc) .. ",\r\n")
+        file:write('  "career": {\r\n')
+        file:write('    "fingerprintCandidate": ' .. json_string(SNAPSHOT_CONTEXT.career_fingerprint_candidate) .. ",\r\n")
+        file:write('    "identityConfidence": ' .. json_string(SNAPSHOT_CONTEXT.career_identity_confidence) .. ",\r\n")
+        file:write('    "managerDisplayName": ' .. json_string(SNAPSHOT_CONTEXT.manager_display_name) .. ",\r\n")
+        file:write('    "managerNationalityId": ' .. json_number(SNAPSHOT_CONTEXT.manager_nationality_id, 0) .. ",\r\n")
+        file:write('    "initialTeamId": ' .. json_number(SNAPSHOT_CONTEXT.initial_team_id, 0) .. ",\r\n")
+        file:write('    "initialTeamName": ' .. json_string(SNAPSHOT_CONTEXT.initial_team_name) .. ",\r\n")
+        file:write('    "managedTeamId": ' .. json_number(SNAPSHOT_CONTEXT.managed_team_id, 0) .. ",\r\n")
+        file:write('    "managedTeamName": ' .. json_string(SNAPSHOT_CONTEXT.managed_team_name) .. ",\r\n")
+        file:write('    "seasonIndex": ' .. json_number(SNAPSHOT_CONTEXT.season_index, 0) .. ",\r\n")
+        file:write('    "careerDate": ' .. json_string(SNAPSHOT_CONTEXT.career_date_iso) .. ",\r\n")
+        file:write('    "careerDateSort": ' .. json_number(SNAPSHOT_CONTEXT.career_date_sort, 0) .. "\r\n")
+        file:write("  },\r\n")
+        file:write('  "ordering": {\r\n')
+        file:write('    "seasonIndex": ' .. json_number(SNAPSHOT_CONTEXT.season_index, 0) .. ",\r\n")
+        file:write('    "careerDateSort": ' .. json_number(SNAPSHOT_CONTEXT.career_date_sort, 0) .. ",\r\n")
+        file:write('    "managedCompletedFixtureCount": ' .. json_number(managed_completed_fixture_count, 0) .. ",\r\n")
+        file:write('    "globalCompletedFixtureCount": ' .. json_number(global_completed_fixture_count, 0) .. ",\r\n")
+        file:write('    "exportedAtUtc": ' .. json_string(SNAPSHOT_CONTEXT.exported_at_utc) .. ",\r\n")
+        file:write('    "snapshotId": ' .. json_string(SNAPSHOT_CONTEXT.snapshot_id) .. "\r\n")
+        file:write("  },\r\n")
+        file:write('  "capabilities": {\r\n')
+        file:write('    "resolvedPlayerNames": true,\r\n')
+        file:write('    "careerAgnosticManagedTeam": true,\r\n')
+        file:write('    "fixturesAndResults": true,\r\n')
+        file:write('    "seasonStatistics": true,\r\n')
+        file:write('    "matchRatings": true,\r\n')
+        file:write('    "teamProfitability": ' .. (TEAM_PROFITABILITY_EXPORTED and "true" or "false") .. ',\r\n')
+        file:write('    "teamProfitabilitySource": "teams.profitability",\r\n')
+        file:write('    "actualMatchPositions": "latest_match_only",\r\n')
+        file:write('    "detailedPlayerMatchStats": false,\r\n')
+        file:write('    "matchEvents": false\r\n')
+        file:write("  },\r\n")
+        file:write('  "files": [\r\n')
+        for i = 1, #MANIFEST_ROWS do
+            local row = MANIFEST_ROWS[i]
+            file:write("    {")
+            file:write('"name":' .. json_string(row[1]) .. ",")
+            file:write('"rowCount":' .. json_number(row[2], 0) .. ",")
+            file:write('"status":' .. json_string(row[3]) .. ",")
+            file:write('"note":' .. json_string(row[4]) .. ",")
+            file:write('"byteSize":' .. json_number(row[5], 0) .. "}")
+            if i < #MANIFEST_ROWS then
+                file:write(",")
+            end
+            file:write("\r\n")
+        end
+        file:write("  ],\r\n")
+        file:write('  "readyMarker": "READY"\r\n')
+        file:write("}\r\n")
+        file:close()
+    end
+
+    log("Export completed; preparing ready snapshot")
+
+    do
+        local log_file = io.open(output_dir .. "\\export_log.txt", "wb")
+        if log_file then
+            log_file:write(CSV_BOM)
+            for i = 1, #LOG_LINES do
+                log_file:write(LOG_LINES[i])
+                log_file:write("\r\n")
+            end
+            log_file:close()
+        end
+    end
+
     local moved, move_error = move_directory(PARTIAL_DIR, READY_DIR)
     if not moved then
-        error("Snapshot could not be moved to ready: " .. tostring(move_error))
+        error("Snapshot was exported but could not be moved to ready: " .. tostring(move_error))
     end
     output_dir = READY_DIR
     write_ready_marker(READY_DIR)
+
+    local final_message = "FC26 snapshot export is ready:\n" .. READY_DIR
+    if #unresolved_names > 0 then
+        final_message = final_message .. "\n\nWarning: " .. tostring(#unresolved_names) .. " player names were unresolved."
+    end
 
     rawset(_G, 'FC26_EXPORT_LAST_EXPORT_RESULT', {
         success = true,
@@ -1110,9 +2042,39 @@ local function run_export()
         snapshot_id = SNAPSHOT_ID,
         exporter_version = EXPORTER_VERSION
     })
+
+    if not rawget(_G, 'FC26_EXPORT_SUPPRESS_SUCCESS_MESSAGE') then
+        pcall(function()
+            MessageBox(final_message, "FC26 Snapshot Exporter")
+        end)
+    end
+
 end
 
 local ok, error_message = xpcall(run_export, debug.traceback)
 if not ok then
+    rawset(_G, 'FC26_EXPORT_LAST_EXPORT_RESULT', {
+        success = false,
+        error = tostring(error_message),
+        output_dir = output_dir,
+        exporter_version = EXPORTER_VERSION
+    })
     log("FATAL ERROR: " .. tostring(error_message))
+
+    local log_file = io.open(output_dir .. "\\export_log.txt", "wb")
+    if log_file then
+        log_file:write(CSV_BOM)
+        for i = 1, #LOG_LINES do
+            log_file:write(LOG_LINES[i])
+            log_file:write("\r\n")
+        end
+        log_file:close()
+    end
+
+    pcall(function()
+        MessageBox(
+            "Export failed. Please send export_log.txt from:\n" .. output_dir,
+            "FC26 Snapshot Exporter - Error"
+        )
+    end)
 end

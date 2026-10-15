@@ -1,0 +1,400 @@
+   384	                }
+   385	                item {
+   386	                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+   387	                        OutlinedTextField(value = shotsFor, onValueChange = { shotsFor = it }, label = { Text("Shots For") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f))
+   388	                        OutlinedTextField(value = shotsAgainst, onValueChange = { shotsAgainst = it }, label = { Text("Shots Against") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f))
+   389	                    }
+   390	                }
+   391	                item {
+   392	                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+   393	                        OutlinedTextField(value = xGFor, onValueChange = { xGFor = it }, label = { Text("xG For") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), modifier = Modifier.weight(1f))
+   394	                        OutlinedTextField(value = xGAgainst, onValueChange = { xGAgainst = it }, label = { Text("xG Against") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), modifier = Modifier.weight(1f))
+   395	                    }
+   396	                }
+   397	                item { OutlinedTextField(value = leaguePosition, onValueChange = { leaguePosition = it }, label = { Text("League Position") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth()) }
+   398	
+   399	                // --- GOAL DETAILS ---
+   400	                if (goalDetails.isNotEmpty()) {
+   401	                    item { Text("Goal Details", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary) }
+   402	                    items(goalDetails.size) { index ->
+   403	                        val gd = goalDetails[index]
+   404	                        Column(modifier = Modifier.fillMaxWidth().border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(8.dp)).padding(8.dp)) {
+   405	                            Text("Goal ${index + 1}", color = Color.White, fontWeight = FontWeight.Bold)
+   406	                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+   407	                                OutlinedTextField(
+   408	                                    value = gd.minute.toString(),
+   409	                                    onValueChange = { newMin ->
+   410	                                        val min = newMin.toIntOrNull() ?: 0
+   411	                                        val newList = goalDetails.toMutableList()
+   412	                                        newList[index] = gd.copy(minute = min)
+   413	                                        goalDetails = newList
+   414	                                    },
+   415	                                    label = { Text("Min") },
+   416	                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+   417	                                    modifier = Modifier.width(80.dp)
+   418	                                )
+   419	                                
+   420	                                var expandScorer by remember { mutableStateOf(false) }
+   421	                                ExposedDropdownMenuBox(expanded = expandScorer, onExpandedChange = { expandScorer = !expandScorer }, modifier = Modifier.weight(1f)) {
+   422	                                    OutlinedTextField(
+   423	                                        value = state.players.find { it.id == gd.scorerId }?.displayName ?: "Scorer",
+   424	                                        onValueChange = {}, readOnly = true, modifier = Modifier.menuAnchor(androidx.compose.material3.MenuAnchorType.PrimaryNotEditable, true).fillMaxWidth()
+   425	                                    )
+   426	                                    ExposedDropdownMenu(expanded = expandScorer, onDismissRequest = { expandScorer = false }) {
+   427	                                        state.players.forEach { p ->
+   428	                                            DropdownMenuItem(text = { Text(p.displayName) }, onClick = { 
+   429	                                                val newList = goalDetails.toMutableList()
+   430	                                                newList[index] = gd.copy(scorerId = p.id)
+   431	                                                goalDetails = newList
+   432	                                                expandScorer = false
+   433	                                            })
+   434	                                        }
+   435	                                    }
+   436	                                }
+   437	                            }
+   438	                            Spacer(Modifier.height(8.dp))
+   439	                            var expandAssist by remember { mutableStateOf(false) }
+   440	                            ExposedDropdownMenuBox(expanded = expandAssist, onExpandedChange = { expandAssist = !expandAssist }, modifier = Modifier.fillMaxWidth()) {
+   441	                                OutlinedTextField(
+   442	                                    value = state.players.find { it.id == gd.assisterId }?.displayName ?: "Assister (Optional)",
+   443	                                    onValueChange = {}, readOnly = true, modifier = Modifier.menuAnchor(androidx.compose.material3.MenuAnchorType.PrimaryNotEditable, true).fillMaxWidth()
+   444	                                )
+   445	                                ExposedDropdownMenu(expanded = expandAssist, onDismissRequest = { expandAssist = false }) {
+   446	                                    DropdownMenuItem(text = { Text("None") }, onClick = { 
+   447	                                        val newList = goalDetails.toMutableList()
+   448	                                        newList[index] = gd.copy(assisterId = null)
+   449	                                        goalDetails = newList
+   450	                                        expandAssist = false
+   451	                                    })
+   452	                                    state.players.forEach { p ->
+   453	                                        DropdownMenuItem(text = { Text(p.displayName) }, onClick = { 
+   454	                                            val newList = goalDetails.toMutableList()
+   455	                                            newList[index] = gd.copy(assisterId = p.id)
+   456	                                            goalDetails = newList
+   457	                                            expandAssist = false
+   458	                                        })
+   459	                                    }
+   460	                                }
+   461	                            }
+   462	                        }
+   463	                    }
+   464	                }
+   465	
+   466	                // --- SUBSTITUTIONS ---
+   467	                item { Text("Substitutions", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary) }
+   468	                items(substitutions.size) { index ->
+   469	                    val sub = substitutions[index]
+   470	                    Column(modifier = Modifier.fillMaxWidth().border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(8.dp)).padding(8.dp)) {
+   471	                        Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+   472	                            Text("Sub ${index + 1}", color = Color.White, fontWeight = FontWeight.Bold)
+   473	                            IconButton(onClick = { 
+   474	                                val newList = substitutions.toMutableList()
+   475	                                newList.removeAt(index)
+   476	                                substitutions = newList
+   477	                            }, modifier = Modifier.size(24.dp)) {
+   478	                                Icon(Icons.Default.Close, contentDescription = "Remove Sub", tint = MaterialTheme.colorScheme.error)
+   479	                            }
+   480	                        }
+   481	                        OutlinedTextField(
+   482	                            value = sub.minute.toString(),
+   483	                            onValueChange = { newMin ->
+   484	                                val min = newMin.toIntOrNull() ?: 0
+   485	                                val newList = substitutions.toMutableList()
+   486	                                newList[index] = sub.copy(minute = min)
+   487	                                substitutions = newList
+   488	                            },
+   489	                            label = { Text("Minute") },
+   490	                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+   491	                            modifier = Modifier.fillMaxWidth()
+   492	                        )
+   493	                        Spacer(Modifier.height(8.dp))
+   494	                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+   495	                            var expandOut by remember { mutableStateOf(false) }
+   496	                            ExposedDropdownMenuBox(expanded = expandOut, onExpandedChange = { expandOut = !expandOut }, modifier = Modifier.weight(1f)) {
+   497	                                OutlinedTextField(
+   498	                                    value = state.players.find { it.id == sub.playerOutId }?.displayName ?: "Player Out",
+   499	                                    onValueChange = {}, readOnly = true, leadingIcon = { Icon(Icons.Default.ArrowDropDown, tint = Color.Red, contentDescription = null) }, modifier = Modifier.menuAnchor(androidx.compose.material3.MenuAnchorType.PrimaryNotEditable, true).fillMaxWidth()
+   500	                                )
+   501	                                ExposedDropdownMenu(expanded = expandOut, onDismissRequest = { expandOut = false }) {
+   502	                                    state.players.forEach { p ->
+   503	                                        DropdownMenuItem(text = { Text(p.displayName) }, onClick = { 
+   504	                                            val newList = substitutions.toMutableList()
+   505	                                            newList[index] = sub.copy(playerOutId = p.id)
+   506	                                            substitutions = newList
+   507	                                            expandOut = false
+   508	                                        })
+   509	                                    }
+   510	                                }
+   511	                            }
+   512	                            
+   513	                            var expandIn by remember { mutableStateOf(false) }
+   514	                            ExposedDropdownMenuBox(expanded = expandIn, onExpandedChange = { expandIn = !expandIn }, modifier = Modifier.weight(1f)) {
+   515	                                OutlinedTextField(
+   516	                                    value = state.players.find { it.id == sub.playerInId }?.displayName ?: "Player In",
+   517	                                    onValueChange = {}, readOnly = true, leadingIcon = { Icon(Icons.Default.ArrowDropUp, tint = Color.Green, contentDescription = null) }, modifier = Modifier.menuAnchor(androidx.compose.material3.MenuAnchorType.PrimaryNotEditable, true).fillMaxWidth()
+   518	                                )
+   519	                                ExposedDropdownMenu(expanded = expandIn, onDismissRequest = { expandIn = false }) {
+   520	                                    state.players.forEach { p ->
+   521	                                        DropdownMenuItem(text = { Text(p.displayName) }, onClick = { 
+   522	                                            val newList = substitutions.toMutableList()
+   523	                                            newList[index] = sub.copy(playerInId = p.id)
+   524	                                            substitutions = newList
+   525	                                            expandIn = false
+   526	                                        })
+   527	                                    }
+   528	                                }
+   529	                            }
+   530	                        }
+   531	                    }
+   532	                }
+   533	                item {
+   534	                    OutlinedButton(onClick = { 
+   535	                        substitutions = substitutions + com.example.Substitution(minute = 45, playerOutId = "", playerInId = "")
+   536	                    }, modifier = Modifier.fillMaxWidth()) {
+   537	                        Icon(Icons.Default.Add, contentDescription = null)
+   538	                        Spacer(Modifier.width(8.dp))
+   539	                        Text("Add Substitution")
+   540	                    }
+   541	                }
+   542	
+   543	                // --- LINEUP & PERFORMANCES ---
+   544	                item { Text("Lineup & Performances", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary) }
+   545	                
+   546	                item {
+   547	                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+   548	                        Button(onClick = {
+   549	                            val activePlayers = state.players.filter { it.status != "Sold" && it.status != "Loaned Out" }.sortedByDescending { it.overall }.take(11)
+   550	                            val currentIds = playerPerformances.map { it.playerId }.toSet()
+   551	                            val newPerformances = activePlayers.filter { it.id !in currentIds }.map { com.example.PlayerPerformance(playerId = it.id) }
+   552	                            playerPerformances = playerPerformances + newPerformances
+   553	                        }, modifier = Modifier.weight(1f)) {
+   554	                            Text("Auto-fill Starting XI", fontSize = 12.sp)
+   555	                        }
+   556	                        
+   557	                        var expandAddPlayer by remember { mutableStateOf(false) }
+   558	                        ExposedDropdownMenuBox(expanded = expandAddPlayer, onExpandedChange = { expandAddPlayer = !expandAddPlayer }, modifier = Modifier.weight(1f)) {
+   559	                            Button(onClick = {}, modifier = Modifier.menuAnchor(androidx.compose.material3.MenuAnchorType.PrimaryNotEditable, true).fillMaxWidth()) {
+   560	                                Text("Add Player", fontSize = 12.sp)
+   561	                            }
+   562	                            ExposedDropdownMenu(expanded = expandAddPlayer, onDismissRequest = { expandAddPlayer = false }) {
+   563	                                val currentIds = playerPerformances.map { it.playerId }.toSet()
+   564	                                state.players.filter { it.id !in currentIds }.forEach { p ->
+   565	                                    DropdownMenuItem(text = { Text(p.displayName) }, onClick = { 
+   566	                                        playerPerformances = playerPerformances + com.example.PlayerPerformance(playerId = p.id)
+   567	                                        expandAddPlayer = false
+   568	                                    })
+   569	                                }
+   570	                            }
+   571	                        }
+   572	                    }
+   573	                }
+   574	                
+   575	                items(playerPerformances.size) { index ->
+   576	                    val pp = playerPerformances[index]
+   577	                    val player = state.players.find { it.id == pp.playerId }
+   578	                    if (player != null) {
+   579	                        Column(modifier = Modifier.fillMaxWidth().border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(8.dp)).padding(8.dp)) {
+   580	                            Row(horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+   581	                                Text(player.displayName, color = Color.White, fontWeight = FontWeight.Bold)
+   582	                                IconButton(onClick = { 
+   583	                                    val newList = playerPerformances.toMutableList()
+   584	                                    newList.removeAt(index)
+   585	                                    playerPerformances = newList
+   586	                                }, modifier = Modifier.size(24.dp)) {
+   587	                                    Icon(Icons.Default.Close, contentDescription = "Remove", tint = MaterialTheme.colorScheme.error)
+   588	                                }
+   589	                            }
+   590	                            
+   591	                            Row(verticalAlignment = Alignment.CenterVertically) {
+   592	                                Text("Rating: ${String.format("%.1f", pp.rating)}", color = Color.White, fontSize = 12.sp)
+   593	                                Slider(
+   594	                                    value = pp.rating.toFloat(),
+   595	                                    onValueChange = { newVal ->
+   596	                                        val newList = playerPerformances.toMutableList()
+   597	                                        newList[index] = pp.copy(rating = newVal.toDouble())
+   598	                                        playerPerformances = newList
+   599	                                    },
+   600	                                    valueRange = 1f..10f,
+   601	                                    steps = 17,
+   602	                                    modifier = Modifier.padding(horizontal = 8.dp).weight(1f)
+   603	                                )
+   604	                            }
+   605	                            
+   606	                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+   607	                                OutlinedTextField(
+   608	                                    value = pp.goals.toString(),
+   609	                                    onValueChange = { newG ->
+   610	                                        val g = newG.toIntOrNull() ?: 0
+   611	                                        val newList = playerPerformances.toMutableList()
+   612	                                        newList[index] = pp.copy(goals = g)
+   613	                                        playerPerformances = newList
+   614	                                    },
+   615	                                    label = { Text("Goals") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f)
+   616	                                )
+   617	                                OutlinedTextField(
+   618	                                    value = pp.assists.toString(),
+   619	                                    onValueChange = { newA ->
+   620	                                        val a = newA.toIntOrNull() ?: 0
+   621	                                        val newList = playerPerformances.toMutableList()
+   622	                                        newList[index] = pp.copy(assists = a)
+   623	                                        playerPerformances = newList
+   624	                                    },
+   625	                                    label = { Text("Assists") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f)
+   626	                                )
+   627	                            }
+   628	                            
+   629	                            Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+   630	                                Row(verticalAlignment = Alignment.CenterVertically) {
+   631	                                    Checkbox(checked = pp.yellowCard, onCheckedChange = { 
+   632	                                        val newList = playerPerformances.toMutableList()
+   633	                                        newList[index] = pp.copy(yellowCard = it)
+   634	                                        playerPerformances = newList
+   635	                                    }, modifier = Modifier.size(24.dp))
+   636	                                    Spacer(Modifier.width(4.dp))
+   637	                                    Box(modifier = Modifier.size(12.dp, 16.dp).background(Color.Yellow))
+   638	                                }
+   639	                                Row(verticalAlignment = Alignment.CenterVertically) {
+   640	                                    Checkbox(checked = pp.redCard, onCheckedChange = { 
+   641	                                        val newList = playerPerformances.toMutableList()
+   642	                                        newList[index] = pp.copy(redCard = it)
+   643	                                        playerPerformances = newList
+   644	                                    }, modifier = Modifier.size(24.dp))
+   645	                                    Spacer(Modifier.width(4.dp))
+   646	                                    Box(modifier = Modifier.size(12.dp, 16.dp).background(Color.Red))
+   647	                                }
+   648	                                Row(verticalAlignment = Alignment.CenterVertically) {
+   649	                                    Checkbox(checked = pp.cleanSheet, onCheckedChange = { 
+   650	                                        val newList = playerPerformances.toMutableList()
+   651	                                        newList[index] = pp.copy(cleanSheet = it)
+   652	                                        playerPerformances = newList
+   653	                                    }, modifier = Modifier.size(24.dp))
+   654	                                    Spacer(Modifier.width(4.dp))
+   655	                                    Text("CS", color = Color.White, fontSize = 12.sp)
+   656	                                }
+   657	                            }
+   658	                        }
+   659	                    }
+   660	                }
+   661	                   
+   662	                item {
+   663	                    var expandedMotm by remember { mutableStateOf(false) }
+   664	                    ExposedDropdownMenuBox(expanded = expandedMotm, onExpandedChange = { expandedMotm = !expandedMotm }) {
+   665	                        OutlinedTextField(
+   666	                            value = state.players.find { it.id == motmId }?.displayName ?: "Select MOTM",
+   667	                            onValueChange = {}, readOnly = true, label = { Text("Man of the Match") },
+   668	                            modifier = Modifier.menuAnchor(androidx.compose.material3.MenuAnchorType.PrimaryNotEditable, true).fillMaxWidth()
+   669	                        )
+   670	                        ExposedDropdownMenu(expanded = expandedMotm, onDismissRequest = { expandedMotm = false }) {
+   671	                            playerPerformances.forEach { pp ->
+   672	                                val p = state.players.find { it.id == pp.playerId }
+   673	                                if (p != null) {
+   674	                                    DropdownMenuItem(text = { Text(p.displayName) }, onClick = { motmId = p.id; expandedMotm = false })
+   675	                                }
+   676	                            }
+   677	                        }
+   678	                    }
+   679	                }
+   680	
+   681	                item { Spacer(Modifier.height(16.dp)) }
+   682	                item {
+   683	                    Button(onClick = {
+   684	                        val finalPerformances = playerPerformances.map { 
+   685	                            if (it.playerId == motmId) it.copy(isMotm = true) else it.copy(isMotm = false)
+   686	                        }
+   687	                        
+   688	                        val match = MatchResult(
+   689	                            opponentName = opponentName,
+   690	                            opponentCrestUrl = opponentCrestUrl,
+   691	                            isHome = isHome,
+   692	                            goalsFor = goalsFor.toIntOrNull() ?: 0,
+   693	                            goalsAgainst = goalsAgainst.toIntOrNull() ?: 0,
+   694	                            matchDate = matchDate,
+   695	                            competition = competition,
+   696	                            stage = stage,
+   697	                            isExtraTime = isExtraTime,
+   698	                            homePenalties = homePenalties.toIntOrNull() ?: 0,
+   699	                            awayPenalties = awayPenalties.toIntOrNull() ?: 0,
+   700	                            possession = possession.toIntOrNull() ?: 50,
+   701	                            passingAccuracy = passingAccuracy.toIntOrNull() ?: 80,
+   702	                            shotsFor = shotsFor.toIntOrNull() ?: 0,
+   703	                            shotsAgainst = shotsAgainst.toIntOrNull() ?: 0,
+   704	                            expectedGoals = xGFor.toDoubleOrNull() ?: 0.0,
+   705	                            expectedGoalsAgainst = xGAgainst.toDoubleOrNull() ?: 0.0,
+   706	                            leaguePosition = leaguePosition.toIntOrNull() ?: 1,
+   707	                            playerPerformances = finalPerformances,
+   708	                            goalDetails = goalDetails,
+   709	                            substitutions = substitutions
+   710	                        )
+   711	                        onSave(match)
+   712	                    }, modifier = Modifier.fillMaxWidth()) {
+   713	                        Text("Save Match Result", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+   714	                    }
+   715	                }
+   716	                item {
+   717	                    TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) {
+   718	                        Text("Cancel", color = Color.White)
+   719	                    }
+   720	                }
+   721	            }
+   722	        }
+   723	    }
+   724	}
+   725	@Composable
+   726	fun MatchResultCard(match: MatchResult, state: AppState? = null) {
+   727	    val badgeColor = when (match.resultBadge) {
+   728	        "W" -> WinColor
+   729	        "D" -> DrawColor
+   730	        else -> LossColor
+   731	    }
+   732	
+   733	    Box(
+   734	        modifier = Modifier
+   735	            .fillMaxWidth()
+   736	            .clip(RoundedCornerShape(12.dp))
+   737	            .background(MaterialTheme.colorScheme.surface)
+   738	            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(12.dp))
+   739	            .padding(16.dp)
+   740	    ) {
+   741	        Column {
+   742	            Row(
+   743	                modifier = Modifier.fillMaxWidth(),
+   744	                horizontalArrangement = Arrangement.SpaceBetween,
+   745	                verticalAlignment = Alignment.CenterVertically
+   746	            ) {
+   747	                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+   748	                    Box(
+   749	                        modifier = Modifier
+   750	                            .size(36.dp)
+   751	                            .clip(CircleShape)
+   752	                            .background(badgeColor),
+   753	                        contentAlignment = Alignment.Center
+   754	                    ) {
+   755	                        Text(match.resultBadge, color = Color(0xFF1A1C18), fontWeight = FontWeight.Bold, fontSize = 16.sp)
+   756	                    }
+   757	                    Column {
+   758	                        Text(if (match.isHome) "vs ${match.opponentName}" else "@ ${match.opponentName}", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
+   759	                        Text("${match.competition} • ${match.matchDate}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+   760	                    }
+   761	                }
+   762	                Text(
+   763	                    "${match.goalsFor} - ${match.goalsAgainst}",
+   764	                    fontSize = 20.sp,
+   765	                    fontWeight = FontWeight.Black,
+   766	                    color = Color.White
+   767	                )
+   768	            }
+   769	            val motm = match.playerPerformances.find { it.isMotm }
+   770	            if (motm != null && state != null) {
+   771	                Spacer(modifier = Modifier.height(8.dp))
+   772	                val player = state.players.find { it.id == motm.playerId }
+   773	                if (player != null) {
+   774	                    Row(verticalAlignment = Alignment.CenterVertically) {
+   775	                        Icon(Icons.Filled.Star, contentDescription = "MOTM", tint = Color.Yellow, modifier = Modifier.size(16.dp))
+   776	                        Spacer(modifier = Modifier.width(4.dp))
+   777	                        Text("MOTM: ${player.displayName}", fontSize = 12.sp, color = Color.White)
+   778	                    }
+   779	                }
+   780	            }
+   781	        }
+   782	    }
+   783	}

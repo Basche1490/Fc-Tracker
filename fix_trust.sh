@@ -1,0 +1,1 @@
+sed -i 's/.*Trust Level:.*/                Text("Trust Level: ${if (percentage > 0.6) \\"High\\" else \\"Low\\"}", color = MaterialTheme.colorScheme.onSurfaceVariant)/g' app/src/main/java/com/example/ui/screens/SeasonSummaryScreen.kt

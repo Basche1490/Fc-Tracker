@@ -10,12 +10,35 @@ local function escape_str(s)
     return s
 end
 
+-- The payload is written to a file first (names with quotes or accents break an inline curl command),
+-- then posted to the bridge on port 5050. Port 8080 is only tried as a last resort for old setups.
 local function send_to_bridge(json_payload)
-    local url = "http://localhost:8080"
-    -- Safely wrap the payload for curl execution in Windows cmd
-    local safe_payload = json_payload:gsub('"', '\\"')
-    local cmd = string.format('curl -s -X POST -H "Content-Type: application/json" -d "%s" %s', safe_payload, url)
-    os.execute(cmd)
+    local temp_dir = os.getenv("TEMP") or os.getenv("TMP") or "."
+    local json_path = temp_dir .. "\\fc26_sender_v2_payload.json"
+    local f = io.open(json_path, "wb")
+    if not f then
+        print("[TelemetrySenderV2] cannot write " .. json_path)
+        return false
+    end
+    f:write(json_payload)
+    f:close()
+
+    local out_path = temp_dir .. "\\fc26_sender_v2_result.txt"
+    for _, port in ipairs({ 5050, 8080 }) do
+        local cmd = 'curl.exe -s -o NUL -w "%{http_code}" -m 6 -X POST -H "Content-Type: application/json; charset=utf-8" --data-binary @"'
+            .. json_path .. '" http://127.0.0.1:' .. port .. ' > "' .. out_path .. '" 2>nul'
+        os.execute(cmd)
+        local rf = io.open(out_path, "r")
+        local code = rf and rf:read("*l") or ""
+        if rf then rf:close() end
+        if code == "200" then
+            os.remove(json_path)
+            print("[TelemetrySenderV2] delivered to bridge on port " .. port)
+            return true
+        end
+    end
+    print("[TelemetrySenderV2] bridge did not accept the payload (is Start_Bridge.bat running?)")
+    return false
 end
 
 -- 1. SEND TRANSFER EVENT

@@ -12,7 +12,6 @@ my_log(">>> TESTING CONNECTION TO TELEMETRY BRIDGE (Port 5050) <<<")
 
 local temp_dir = os.getenv("TEMP") or os.getenv("TMP") or "."
 local temp_json = temp_dir .. "\\fifa_test_payload.json"
-local temp_bat = temp_dir .. "\\fifa_test_send.bat"
 
 local today = os.date("%Y-%m-%d")
 local payload = string.format([[{
@@ -55,16 +54,33 @@ if f then
     my_log("Wrote test payload (" .. tostring(#payload) .. " bytes)")
 end
 
-local bf = io.open(temp_bat, "w")
-if bf then
-    bf:write(string.format([[@echo off
-curl -s -X POST -H "Content-Type: application/json; charset=utf-8" --data-binary @"%s" http://127.0.0.1:5050
-if %%ERRORLEVEL%% NEQ 0 (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Invoke-RestMethod -Uri 'http://127.0.0.1:5050' -Method POST -ContentType 'application/json; charset=utf-8' -InFile '%s'; Write-Host 'Dispatched via PowerShell' } catch { Write-Host 'Failed to connect to bridge: ' $_.Exception.Message }"
-)
-]], temp_json, temp_json))
-    bf:close()
-    my_log("Dispatching to Bridge http://127.0.0.1:5050...")
-    os.execute(string.format('start /B "" "%s"', temp_bat))
-    my_log(">>> TEST SENT! Look at your bridge command prompt and Android App!")
+local out_path = temp_dir .. "\\fifa_test_result.txt"
+
+local function http_code(args)
+    os.remove(out_path)
+    os.execute('curl.exe -s -o NUL -w "%{http_code}" -m 5 ' .. args .. ' > "' .. out_path .. '" 2>nul')
+    local rf = io.open(out_path, "r")
+    local code = rf and rf:read("*l") or ""
+    if rf then rf:close() end
+    return (code ~= "") and code or "no answer"
 end
+
+-- 1. Is the bridge reachable at all? (GET /events is what the phone uses)
+local readCode = http_code('http://127.0.0.1:5050/events')
+my_log("GET  /events  -> HTTP " .. readCode)
+
+-- 2. Can this PC post a match to it? (this adds a sample "Arsenal 3-1" match to your app)
+local postCode = http_code('-X POST -H "Content-Type: application/json; charset=utf-8" --data-binary @"' .. temp_json .. '" http://127.0.0.1:5050')
+my_log("POST sample match -> HTTP " .. postCode)
+
+print("=========================================================================")
+if postCode == "200" then
+    print(" [OK] The bridge accepted the test match. It should appear in your phone app within ~10 seconds.")
+elseif readCode == "no answer" or readCode == "000" then
+    print(" [FAIL] Nothing is listening on port 5050. Start Start_Bridge.bat (or Start_Bridge_Python.bat) first.")
+else
+    print(" [FAIL] The bridge answered GET with HTTP " .. readCode .. " but POST with HTTP " .. postCode .. ".")
+    print("        403 = request refused (writes are only accepted from this PC), 413 = too large, 400 = bad request.")
+end
+print("=========================================================================")
+os.remove(temp_json)

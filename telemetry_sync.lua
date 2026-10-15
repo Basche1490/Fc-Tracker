@@ -1,28 +1,64 @@
 -- =========================================================================
--- EA SPORTS FC LIVE TELEMETRY SYNC (v4.8 - Precision Transfers & Matches)
+-- EA SPORTS FC LIVE TELEMETRY SYNC (v4.9 - reliable delivery, lighter polling)
 -- Supports Create-a-Club, League Matches, Cup Matches, Pre-Season & Transfers
+--
+-- NOTE: FC26_Auto_Capture.lua is the recommended script (it reads the real fixture, lineup and
+-- stats data). This script is the database-delta fallback; it stands down automatically while
+-- FC26_Auto_Capture.lua is running so the same match is never reported twice.
 -- =========================================================================
 
 -- SET TO true TO FORCE-SEND THE MOST RECENT MATCH IMMEDIATELY ON RUN:
 local FORCE_SYNC_LATEST = false
 
 -- AUTO-SYNC CONFIGURATION:
+-- Each pass reads several very large tables, so it runs every 15 seconds (it was every 3 seconds).
+-- Match and squad changes are cumulative, so nothing is missed by checking less often.
 local AUTO_SYNC = true
-local AUTO_SYNC_INTERVAL_SEC = 3
+local AUTO_SYNC_INTERVAL_SEC = 15
 
+local user_profile = os.getenv("USERPROFILE") or ""
+local COMMUNITY_ROOT = (user_profile ~= "" and user_profile or ".") .. "/Documents/FC26 Export"
+local OUTBOX_DIR = COMMUNITY_ROOT .. "/outbox"
+
+local function win_path(p)
+    local converted = tostring(p or ""):gsub("/", string.char(92))
+    return converted
+end
+
+local function trim(value)
+    local text = tostring(value or "")
+    text = text:gsub("^%s+", "")
+    text = text:gsub("%s+$", "")
+    return text
+end
+
+local function file_exists(path)
+    local f = io.open(path, "rb")
+    if f then f:close() return true end
+    return false
+end
+
+pcall(function()
+    os.execute('if not exist "' .. win_path(COMMUNITY_ROOT) .. '" mkdir "' .. win_path(COMMUNITY_ROOT) .. '"')
+    os.execute('if not exist "' .. win_path(OUTBOX_DIR) .. '" mkdir "' .. win_path(OUTBOX_DIR) .. '"')
+end)
+
+-- Files used to live on the Desktop, which is often redirected into OneDrive (the folder then does not
+-- exist at %USERPROFILE%\Desktop and every save silently failed - so no change was ever detected).
+-- Everything now lives in Documents\FC26 Export; the old Desktop files are still read once for migration.
 local function my_log(msg)
     local s = "[TelemetrySync] " .. tostring(msg)
     pcall(print, s)
     pcall(function()
-        local userProfile = os.getenv("USERPROFILE") or ""
-        local logPath = (userProfile ~= "") and (userProfile .. "\\Desktop\\telemetry_sync_log.txt") or "telemetry_sync_log.txt"
-        local f = io.open(logPath, "a")
+        local f = io.open(COMMUNITY_ROOT .. "/telemetry_sync_log.txt", "a")
         if f then
             f:write(os.date("%Y-%m-%d %H:%M:%S") .. " " .. s .. "\n")
             f:close()
         end
     end)
 end
+
+local function log_monitor(msg) my_log(msg) end
 
 local function safe_get_rows(tbl_name)
     local ok, res = pcall(GetDBTableRows, tbl_name)
@@ -85,56 +121,265 @@ local function decode_fifa_date(days, defYear)
     end
 end
 
-local function send_to_bridge(json_payload)
-    local temp_dir = os.getenv("TEMP") or os.getenv("TMP") or "."
-    local ts = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999))
-    local temp_json = temp_dir .. "\\fifa_telemetry_payload_" .. ts .. ".json"
-    local temp_bat = temp_dir .. "\\fifa_send_telemetry_" .. ts .. ".bat"
-    
-    local jf = io.open(temp_json, "wb")
-    if jf then
-        jf:write(json_payload)
-        jf:close()
-    end
-    
-    local bf = io.open(temp_bat, "w")
-    if bf then
-        bf:write(string.format([[@echo off
-curl -s -X POST -H "Content-Type: application/json; charset=utf-8" --data-binary @"%s" http://127.0.0.1:5050 >nul 2>&1
-if %%ERRORLEVEL%% NEQ 0 (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Invoke-RestMethod -Uri 'http://127.0.0.1:5050' -Method POST -ContentType 'application/json; charset=utf-8' -InFile '%s' } catch {}" >nul 2>&1
-)
-del "%s" >nul 2>&1
-(goto) 2>nul & del "%%~f0" >nul 2>&1 & exit
-]], temp_json, temp_json, temp_json))
-        bf:close()
-        os.execute(string.format('start /min "" cmd /c "%s"', temp_bat))
-        my_log("Dispatched payload to bridge (" .. tostring(#json_payload) .. " bytes)")
-    end
-end
+-- ---------------------------------------------------------------------------
+-- Minimal JSON syntax check. Every payload is validated before it leaves the
+-- game, so one odd player name can never put a broken event on the bridge.
+-- ---------------------------------------------------------------------------
+local function json_check(text)
+    local pos = 1
+    local len = #text
+    local fail_msg = nil
 
-function run_telemetry_sync(isAuto)
-    if not isAuto then
-        my_log(">>> RUNNING TELEMETRY SYNC V4.8 <<<")
+    local function fail(msg)
+        if not fail_msg then fail_msg = msg .. " at char " .. tostring(pos) end
+        return false
     end
-    
-    local userProfile = os.getenv("USERPROFILE") or ""
-    local statePath = (userProfile ~= "") and (userProfile .. "\\Desktop\\telemetry_state.lua") or "telemetry_state.lua"
-    local candidateStatePaths = {
-        userProfile .. "\\Desktop\\FC26-LE\\telemetry_state.lua",
-        userProfile .. "\\Desktop\\telemetry_state.lua",
-        "telemetry_state.lua"
-    }
-    for _, sp in ipairs(candidateStatePaths) do
-        local sf = io.open(sp, "r")
-        if sf then
-            sf:close()
-            statePath = sp
-            break
+    local function skip_ws()
+        pos = text:find("[^ \t\r\n]", pos) or (len + 1)
+    end
+
+    local parse_value
+
+    local function parse_string()
+        pos = pos + 1 -- opening quote
+        while pos <= len do
+            local c = text:sub(pos, pos)
+            if c == '"' then
+                pos = pos + 1
+                return true
+            elseif c == "\\" then
+                local e = text:sub(pos + 1, pos + 1)
+                if e == "u" then
+                    if not text:sub(pos + 2, pos + 5):match("^%x%x%x%x$") then return fail("bad \\u escape") end
+                    pos = pos + 6
+                elseif e:match('^["\\/bfnrt]$') then
+                    pos = pos + 2
+                else
+                    return fail("bad escape")
+                end
+            elseif c:byte() < 32 then
+                return fail("control character in string")
+            else
+                pos = pos + 1
+            end
+        end
+        return fail("unterminated string")
+    end
+
+    local function parse_number()
+        local s = text:match("^-?%d+%.?%d*[eE]?[+-]?%d*", pos)
+        if not s or s == "" or s == "-" then return fail("bad number") end
+        if not tonumber(s) then return fail("bad number") end
+        pos = pos + #s
+        return true
+    end
+
+    local function parse_array()
+        pos = pos + 1
+        skip_ws()
+        if text:sub(pos, pos) == "]" then pos = pos + 1 return true end
+        while true do
+            skip_ws()
+            if not parse_value() then return false end
+            skip_ws()
+            local c = text:sub(pos, pos)
+            if c == "," then pos = pos + 1
+            elseif c == "]" then pos = pos + 1 return true
+            else return fail("expected , or ]") end
         end
     end
 
-    -- 1. Build lookup maps
+    local function parse_object()
+        pos = pos + 1
+        skip_ws()
+        if text:sub(pos, pos) == "}" then pos = pos + 1 return true end
+        while true do
+            skip_ws()
+            if text:sub(pos, pos) ~= '"' then return fail("expected key") end
+            if not parse_string() then return false end
+            skip_ws()
+            if text:sub(pos, pos) ~= ":" then return fail("expected :") end
+            pos = pos + 1
+            skip_ws()
+            if not parse_value() then return false end
+            skip_ws()
+            local c = text:sub(pos, pos)
+            if c == "," then pos = pos + 1
+            elseif c == "}" then pos = pos + 1 return true
+            else return fail("expected , or }") end
+        end
+    end
+
+    parse_value = function()
+        skip_ws()
+        local c = text:sub(pos, pos)
+        if c == "{" then return parse_object()
+        elseif c == "[" then return parse_array()
+        elseif c == '"' then return parse_string()
+        elseif text:sub(pos, pos + 3) == "true" then pos = pos + 4 return true
+        elseif text:sub(pos, pos + 4) == "false" then pos = pos + 5 return true
+        elseif text:sub(pos, pos + 3) == "null" then pos = pos + 4 return true
+        elseif c == "-" or c:match("%d") then return parse_number()
+        end
+        return fail("unexpected character")
+    end
+
+    if type(text) ~= "string" or text == "" then return false, "empty payload" end
+    local ok = parse_value()
+    if ok then
+        skip_ws()
+        if pos <= len then return false, "trailing characters at char " .. tostring(pos) end
+        return true
+    end
+    return false, fail_msg or "invalid JSON"
+end
+
+-- ---------------------------------------------------------------------------
+-- Reliable delivery to the bridge ("outbox").
+-- Each payload is written to Documents\FC26 Export\outbox and a small .bat posts
+-- it to the bridge on this PC. The .bat only deletes the file after the bridge
+-- answers HTTP 200, and writes the HTTP code to bridge_send_log.txt. Anything
+-- still in the outbox (bridge was closed, firewall hiccup...) is retried every
+-- 30 s and picked up again the next time the script starts.
+-- ---------------------------------------------------------------------------
+local SEND_LOG = COMMUNITY_ROOT .. "/bridge_send_log.txt"
+local OUTBOX_RETRY_SECONDS = 30
+local OUTBOX_MAX_ATTEMPTS = 40
+local OUTBOX_MAX_AGE_SECONDS = 7 * 24 * 3600
+
+local SENDER_BAT = [[
+@echo off
+set "J=@@JSON@@"
+set "L=@@LOG@@"
+set "ID=@@ID@@"
+set "CODE=000"
+call :try http://127.0.0.1:5050
+if not "%CODE%"=="200" ping -n 2 127.0.0.1 >nul
+if not "%CODE%"=="200" call :try http://127.0.0.1:5050
+if not "%CODE%"=="200" call :try http://127.0.0.1:8080
+if not "%CODE%"=="200" call :psfallback
+>>"%L%" echo %date% %time% [%ID%] HTTP %CODE%
+if "%CODE%"=="200" del "%J%" >nul 2>&1
+(goto) 2>nul & del "%~f0" >nul 2>&1 & exit
+:try
+for /f "usebackq delims=" %%C in (`curl.exe -s -o NUL -w "%%{http_code}" -m 6 -X POST -H "Content-Type: application/json; charset=utf-8" --data-binary @"%J%" %1 2^>NUL`) do set "CODE=%%C"
+exit /b
+:psfallback
+for /f "usebackq delims=" %%C in (`powershell -NoProfile -Command "try { (Invoke-WebRequest -UseBasicParsing -Uri http://127.0.0.1:5050 -Method Post -ContentType 'application/json; charset=utf-8' -InFile '%J%' -TimeoutSec 6).StatusCode } catch { 0 }" 2^>NUL`) do set "CODE=%%C"
+exit /b
+]]
+
+local outbox_pending = {} -- json path -> { id = , tries = , last_try = }
+
+local function launch_outbox_sender(json_path, id)
+    local temp_dir = os.getenv("TEMP") or os.getenv("TMP") or "."
+    local bat_path = temp_dir .. "/fc26_send_" .. id .. ".bat"
+    local body = SENDER_BAT
+    body = body:gsub("@@JSON@@", function() return win_path(json_path) end)
+    body = body:gsub("@@LOG@@", function() return win_path(SEND_LOG) end)
+    body = body:gsub("@@ID@@", function() return id end)
+    local bf = io.open(bat_path, "w")
+    if not bf then return false end
+    bf:write(body)
+    bf:close()
+    os.execute('start /min "" cmd /c "' .. win_path(bat_path) .. '"')
+    return true
+end
+
+local function track_outbox_file(json_path, id)
+    outbox_pending[json_path] = outbox_pending[json_path] or { id = id, tries = 0, last_try = 0 }
+    local entry = outbox_pending[json_path]
+    entry.tries = entry.tries + 1
+    entry.last_try = os.time()
+    return launch_outbox_sender(json_path, id)
+end
+
+local function send_payload_to_bridge(payload, log_label)
+    local ok, err = xpcall(function()
+        local valid, why = json_check(payload)
+        if not valid then
+            log_monitor("PAYLOAD REJECTED (" .. tostring(why) .. ") for " .. tostring(log_label) .. " - not sent")
+            local bad = io.open(COMMUNITY_ROOT .. "/last_bad_payload.json", "wb")
+            if bad then bad:write(payload) bad:close() end
+            return
+        end
+
+        local id = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999))
+        local json_path = OUTBOX_DIR .. "/" .. id .. ".json"
+        local jf = io.open(json_path, "wb")
+        if not jf then
+            log_monitor("Cannot write " .. json_path .. " - payload not sent")
+            return
+        end
+        jf:write(payload)
+        jf:close()
+
+        if track_outbox_file(json_path, id) then
+            log_monitor("Queued for bridge [" .. id .. "]: " .. tostring(log_label) .. "  (result is written to bridge_send_log.txt)")
+        else
+            log_monitor("Could not start the sender for [" .. id .. "] - will retry")
+        end
+    end, debug.traceback)
+    if not ok then
+        log_monitor("Error in send_payload_to_bridge: " .. tostring(err))
+    end
+end
+
+-- Re-send anything the bridge has not acknowledged yet. Cheap: no process is started unless something is waiting.
+local function service_outbox()
+    local now = os.time()
+    for json_path, entry in pairs(outbox_pending) do
+        if not file_exists(json_path) then
+            outbox_pending[json_path] = nil -- delivered (the .bat deleted it)
+        elseif entry.tries >= OUTBOX_MAX_ATTEMPTS then
+            -- leave the file in the outbox; it is adopted again on the next script start
+            outbox_pending[json_path] = nil
+        elseif now - entry.last_try >= OUTBOX_RETRY_SECONDS then
+            entry.tries = entry.tries + 1
+            entry.last_try = now
+            launch_outbox_sender(json_path, entry.id)
+            log_monitor("Retrying undelivered payload [" .. entry.id .. "] (attempt " .. entry.tries .. ")")
+        end
+    end
+end
+
+-- On startup: pick up payloads that were never delivered last time (bridge was not running).
+local function adopt_outbox_leftovers()
+    local temp_dir = os.getenv("TEMP") or os.getenv("TMP") or "."
+    local list_file = temp_dir .. "/fc26_outbox_" .. tostring(os.time()) .. ".txt"
+    pcall(os.execute, string.format('cmd /c dir /b "%s" > "%s" 2>nul', win_path(OUTBOX_DIR .. "/*.json"), win_path(list_file)))
+    local lf = io.open(list_file, "r")
+    if not lf then return 0 end
+    local adopted = 0
+    local now = os.time()
+    for line in lf:lines() do
+        local name = trim(line)
+        local ts = tonumber(name:match("^(%d+)_%d+%.json$"))
+        if ts then
+            local path = OUTBOX_DIR .. "/" .. name
+            if now - ts > OUTBOX_MAX_AGE_SECONDS then
+                pcall(os.remove, path)
+            elseif not outbox_pending[path] then
+                outbox_pending[path] = { id = name:gsub("%.json$", ""), tries = 0, last_try = 0 }
+                adopted = adopted + 1
+            end
+        end
+    end
+    lf:close()
+    pcall(os.remove, list_file)
+    if adopted > 0 then
+        log_monitor("Found " .. adopted .. " undelivered payload(s) from an earlier session - sending now")
+    end
+    return adopted
+end
+
+local function send_to_bridge(json_payload, label)
+    send_payload_to_bridge(json_payload, label or "payload")
+end
+
+-- Lookup tables (names, leagues, teams, players) are large and almost never change: build them once and
+-- reuse them for five minutes instead of re-reading ~100k rows on every pass.
+local function build_lookup_cache()
     local playernamesMap = {}
     for _, pn in ipairs(safe_get_rows("playernames")) do
         local nid = tonumber(val(pn, "nameid", 0)) or 0
@@ -174,12 +419,6 @@ function run_telemetry_sync(isAuto)
         end
     end
 
-    local function get_team_name(tId)
-        local n = teamMap[tonumber(tId) or 0]
-        if n and n ~= "" and not tostring(n):find("^%*") then return n end
-        return "Team " .. tostring(tId)
-    end
-
     -- Fast player lookup map
     local playersMap = {}
     for _, p in ipairs(safe_get_rows("players")) do
@@ -187,8 +426,67 @@ function run_telemetry_sync(isAuto)
         if pid > 0 then playersMap[pid] = p end
     end
 
+    return { built = os.time(), playernames = playernamesMap, leagues = leagueMap, teams = teamMap, players = playersMap }
+end
+
+function run_telemetry_sync(isAuto)
+    -- Real-data script is running: do not report the same matches/transfers a second time.
+    local ac = _G["FC26_AUTO_CAPTURE_STATE"]
+    if ac and ac.active and _G["FC26_AUTOCAPTURE_CURRENT_INSTANCE"] == ac.instance_id then
+        if not _G["FC26_SYNC_STOOD_DOWN"] then
+            _G["FC26_SYNC_STOOD_DOWN"] = true
+            my_log("FC26_Auto_Capture.lua is active - telemetry_sync.lua stands down (no duplicate events).")
+        end
+        return
+    end
+    _G["FC26_SYNC_STOOD_DOWN"] = nil
+
+    if not isAuto then
+        my_log(">>> RUNNING TELEMETRY SYNC V4.9 <<<")
+    end
+    service_outbox()
+
+    local statePath = COMMUNITY_ROOT .. "/telemetry_state.lua"
+    local legacyStatePaths = {
+        user_profile .. "\\Desktop\\FC26-LE\\telemetry_state.lua",
+        user_profile .. "\\Desktop\\telemetry_state.lua",
+        "telemetry_state.lua"
+    }
+    if not file_exists(statePath) then
+        for _, sp in ipairs(legacyStatePaths) do
+            if file_exists(sp) then
+                local okm, resm = pcall(dofile, sp)
+                if okm and type(resm) == "table" then
+                    _G["FC26_SYNC_MIGRATED_STATE"] = resm
+                end
+                break
+            end
+        end
+    end
+
+    -- 1. Lookup maps (cached)
+    local cache = _G["FC26_SYNC_CACHE"]
+    if not cache or (os.time() - cache.built) > 300 then
+        cache = build_lookup_cache()
+        _G["FC26_SYNC_CACHE"] = cache
+    end
+    local playernamesMap, leagueMap, teamMap, playersMap = cache.playernames, cache.leagues, cache.teams, cache.players
+
+    local function get_team_name(tId)
+        local n = teamMap[tonumber(tId) or 0]
+        if n and n ~= "" and not tostring(n):find("^%*") then return n end
+        return "Team " .. tostring(tId)
+    end
+
     local function get_player_name(pId)
         local p = playersMap and playersMap[pId]
+        if not p and (os.time() - cache.built) > 30 then
+            -- player created after the cache was built (youth intake, regen): refresh once
+            cache = build_lookup_cache()
+            _G["FC26_SYNC_CACHE"] = cache
+            playernamesMap, leagueMap, teamMap, playersMap = cache.playernames, cache.leagues, cache.teams, cache.players
+            p = playersMap[pId]
+        end
         if p then
             local pfname = val(p, "firstname", "")
             if pfname == "" then pfname = playernamesMap[tonumber(val(p, "firstnameid", 0)) or 0] or "" end
@@ -266,11 +564,20 @@ function run_telemetry_sync(isAuto)
     local totalSquadForm = 0
     local squadCount = 0
 
+    -- Players are also linked to national / special teams. Only league clubs count when we remember
+    -- "which club did he come from / go to", otherwise a signing shows up as coming from "England".
+    local ltlRows = safe_get_rows("leagueteamlinks")
+    local clubSet, haveClubs = {}, false
+    for _, ltl in ipairs(ltlRows) do
+        local ctid = tonumber(val(ltl, "teamid", 0)) or 0
+        if ctid > 0 then clubSet[ctid] = true haveClubs = true end
+    end
+
     for _, tpl in ipairs(safe_get_rows("teamplayerlinks")) do
         local tid = tonumber(val(tpl, "teamid", 0)) or 0
         local pId = tonumber(val(tpl, "playerid", 0)) or 0
         if pId > 0 and tid > 0 then
-            playerToTeamMap[pId] = tid
+            if (not haveClubs) or clubSet[tid] then playerToTeamMap[pId] = tid end
             if tid == userTeamId then
                 currentSquad[pId] = true
                 squadCount = squadCount + 1
@@ -340,7 +647,7 @@ function run_telemetry_sync(isAuto)
     local bestLtl = nil
     local totalUserLtls = 0
 
-    for _, ltl in ipairs(safe_get_rows("leagueteamlinks")) do
+    for _, ltl in ipairs(ltlRows) do
         local tId = tonumber(val(ltl, "teamid", 0)) or 0
         if tId == userTeamId then
             totalUserLtls = totalUserLtls + 1
@@ -428,6 +735,11 @@ function run_telemetry_sync(isAuto)
         sf:close()
         local ok, res = pcall(dofile, statePath)
         if ok and type(res) == "table" then state = res end
+    end
+
+    if not state and _G["FC26_SYNC_MIGRATED_STATE"] then
+        state = _G["FC26_SYNC_MIGRATED_STATE"]
+        _G["FC26_SYNC_MIGRATED_STATE"] = nil
     end
 
     if state then
@@ -594,7 +906,7 @@ function run_telemetry_sync(isAuto)
             title, msg, oppName, isHome and "true" or "false", gf, ga, badge, todayDateStr, competitionName, stageName, isET and "true" or "false", homePens, awayPens, poss, shotsF, shotsA, xGF, xGA, 1, topPlayerName, matchPerfsStr, matchGoalsStr
         )
 
-        send_to_bridge(payload)
+        send_to_bridge(payload, "Match: " .. msg)
         my_log(">>> SENT MATCH RESULT: " .. msg)
         pcall(print, string.format("[TelemetrySync ⚡ MATCH SYNCED] %s", msg))
     else
@@ -604,16 +916,34 @@ function run_telemetry_sync(isAuto)
         end
     end
 
+    -- A failed or partial read of the squad must never be treated as "everyone left" (and must not overwrite the saved state).
+    local prevSquadSize = 0
+    for _ in pairs((state and state.squad) or {}) do prevSquadSize = prevSquadSize + 1 end
+    if squadCount == 0 or (prevSquadSize >= 12 and squadCount < math.floor(prevSquadSize / 2)) then
+        if not isAuto then my_log("Squad read looks incomplete (" .. tostring(squadCount) .. " players) - transfer check skipped this pass") end
+        return
+    end
+
+    local loansIn, loansOut = {}, {}
+    for _, lo in ipairs(safe_get_rows("playerloans")) do
+        local lpid = tonumber(val(lo, "playerid", 0)) or 0
+        local lfrom = tonumber(val(lo, "teamidloanedfrom", 0)) or 0
+        local lto = tonumber(val(lo, "teamidloanedto", 0)) or 0
+        if lpid > 0 then
+            if lto == userTeamId then loansIn[lpid] = lfrom elseif lfrom == userTeamId then loansOut[lpid] = lto end
+        end
+    end
+
     -- 8. PRECISION TRANSFER LOGIC
     for pId, _ in pairs(currentSquad) do
         if state and state.squad and not state.squad[pId] then
             local pName = get_player_name(pId)
             local feeM = 0.0
-            local transferType = "Transfer In"
+            local transferType = loansIn[pId] and "In (Loan)" or "In (Permanent)"
             local fromClub = ""
             
             -- Step A: Did this player come from a specific team?
-            local prevTid = (state.allPlayerTeams and state.allPlayerTeams[pId]) or playerToTeamMap[pId] or 0
+            local prevTid = loansIn[pId] or (state.allPlayerTeams and state.allPlayerTeams[pId]) or 0
             if prevTid > 0 and prevTid ~= userTeamId then
                 fromClub = get_team_name(prevTid)
             end
@@ -622,7 +952,6 @@ function run_telemetry_sync(isAuto)
             local cameFromAnotherClub = (fromClub ~= "" and fromClub ~= "External Club" and not tostring(fromClub):find("^Team ") and fromClub ~= userClubName)
 
             if cameFromAnotherClub then
-                transferType = "Transfer In"
                 -- Check if this player matches bigbuyplayername in career_managerhistory
                 for bNameLower, bFee in pairs(bigBuysMap) do
                     if pName:lower():find(bNameLower, 1, true) or bNameLower:find(pName:lower(), 1, true) then
@@ -648,7 +977,6 @@ function run_telemetry_sync(isAuto)
                     feeM = 0.0
                 else
                     fromClub = "External Club"
-                    transferType = "Transfer In"
                     feeM = 0.0
                 end
             end
@@ -665,10 +993,10 @@ function run_telemetry_sync(isAuto)
 
             local msg = string.format("%s joined from %s!", pName, fromClub)
             local payload = string.format(
-                '{"dataType":"transfer","title":"Transfer Alert","message":"%s","playerName":"%s","type":"%s","feeM":%.2f,"fromToClub":"%s","date":"%s"}',
-                msg, pName, transferType, feeM, fromClub, transferDateStr
+                '{"dataType":"transfer","title":"Transfer: %s","message":"%s","playerName":"%s","type":"%s","feeM":%.2f,"fromToClub":"%s","date":"%s"}',
+                pName, msg, pName, transferType, feeM, fromClub, transferDateStr
             )
-            send_to_bridge(payload)
+            send_to_bridge(payload, "Transfer In: " .. pName)
             my_log(string.format("Sent Transfer In: %s (From: %s | Fee: £%.2fM | Date: %s)", pName, fromClub, feeM, transferDateStr))
             pcall(print, string.format("[TelemetrySync ⚡ TRANSFER IN] %s (From: %s | £%.2fM | %s)", pName, fromClub, feeM, transferDateStr))
         end
@@ -678,19 +1006,20 @@ function run_telemetry_sync(isAuto)
         if not currentSquad[pId] then
             local pName = get_player_name(pId)
             local toClub = "External Club"
-            local newTid = playerToTeamMap[pId]
+            local newTid = loansOut[pId] or playerToTeamMap[pId]
             if newTid and newTid > 0 and newTid ~= userTeamId then
                 toClub = get_team_name(newTid)
             else
                 toClub = "Free Agent / Released"
             end
+            local outType = loansOut[pId] and "Out (Loan)" or "Out (Permanent)"
 
             local msg = string.format("%s transferred to %s.", pName, toClub)
             local payload = string.format(
-                '{"dataType":"transfer","title":"Transfer Alert","message":"%s","playerName":"%s","type":"Transfer Out","feeM":0.0,"fromToClub":"%s","date":"%s"}',
-                msg, pName, toClub, todayDateStr
+                '{"dataType":"transfer","title":"Transfer: %s","message":"%s","playerName":"%s","type":"%s","feeM":0.0,"fromToClub":"%s","date":"%s"}',
+                pName, msg, pName, outType, toClub, todayDateStr
             )
-            send_to_bridge(payload)
+            send_to_bridge(payload, "Transfer Out: " .. pName)
             my_log(string.format("Sent Transfer Out: %s (To: %s)", pName, toClub))
             pcall(print, string.format("[TelemetrySync ⚡ TRANSFER OUT] %s", msg))
         end
@@ -744,12 +1073,15 @@ return {
     squadDump, pStatsDump, allTeamsDump))
         outf:close()
         if not isAuto then
-            my_log("State saved successfully.")
+            my_log("State saved successfully (" .. statePath .. ").")
         end
+    else
+        my_log("WARNING: could not write " .. statePath .. " - changes cannot be detected without it")
     end
 end
 
--- Run sync immediately
+-- Deliver anything an earlier session could not hand to the bridge, then run a sync immediately
+pcall(adopt_outbox_leftovers)
 local ok, err = pcall(function() run_telemetry_sync(false) end)
 if not ok then
     my_log("CRITICAL ERROR: " .. tostring(err))
@@ -774,7 +1106,16 @@ if AUTO_SYNC then
         local okTimer, t = pcall(function()
             local timer = createTimer(nil)
             timer.Interval = AUTO_SYNC_INTERVAL_SEC * 1000
-            timer.OnTimer = function() pcall(function() run_telemetry_sync(true) end) end
+            timer.OnTimer = function()
+                local okRun, errRun = pcall(function() run_telemetry_sync(true) end)
+                if not okRun then
+                    local now = os.time()
+                    if now - (_G["FC26_SYNC_LAST_ERR"] or 0) >= 60 then
+                        _G["FC26_SYNC_LAST_ERR"] = now
+                        my_log("ERROR in background sync: " .. tostring(errRun))
+                    end
+                end
+            end
             return timer
         end)
         if okTimer and t then
@@ -784,10 +1125,10 @@ if AUTO_SYNC then
     end
 
     if timerCreated then
-        print("[TelemetrySync] Background polling active (every 3s).")
+        print("[TelemetrySync] Background polling active (every " .. AUTO_SYNC_INTERVAL_SEC .. "s).")
     else
         print("=========================================================================")
-        print(" [READY] EA FC LIVE TELEMETRY SYNC ACTIVE (v4.8)!")
+        print(" [READY] EA FC LIVE TELEMETRY SYNC ACTIVE (v4.9)!")
         print(" Whenever you finish a match or make transfers:")
         print(" 1. Click 'Advance' on the post-match screen to return to Central Hub.")
         print(" 2. In Live Editor, tap 'Run' on telemetry_sync.lua (or hotkey F9)!")

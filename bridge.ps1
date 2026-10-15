@@ -1,4 +1,4 @@
-# EA Sports FC Live Telemetry Bridge (Native PowerShell - No Python Required)
+﻿# EA Sports FC Live Telemetry Bridge (Native PowerShell - No Python Required)
 param(
     [int]$Port = 5050
 )
@@ -62,16 +62,146 @@ Write-Host "🌐 WEB DASHBOARD & MANUAL TESTING:" -ForegroundColor Yellow
 Write-Host "   http://localhost:${Port}" -ForegroundColor White
 Write-Host "===================================================" -ForegroundColor Cyan
 
+# =========================================================================
+# SMALL HELPERS
+# =========================================================================
+# CSV exports contain decimals ("86.4"), empty cells and sometimes text. A bare [int]"86.4" throws, which
+# used to abort the whole import silently, so every conversion goes through these helpers.
+function ConvertTo-Dbl {
+    param($Value, [double]$Default = 0.0)
+    if ($null -eq $Value) { return $Default }
+    $s = ([string]$Value).Trim()
+    if ($s -eq "") { return $Default }
+    $d = 0.0
+    if ([double]::TryParse($s, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$d)) {
+        if ([double]::IsNaN($d) -or [double]::IsInfinity($d)) { return $Default }
+        return $d
+    }
+    return $Default
+}
+
+function ConvertTo-Int {
+    param($Value, [int]$Default = 0)
+    $d = ConvertTo-Dbl $Value ([double]$Default)
+    if ($d -gt 2147483647 -or $d -lt -2147483648) { return $Default }
+    return [int][Math]::Round($d, [MidpointRounding]::AwayFromZero)
+}
+
+# 0.55 -> 55 ; 55 -> 55
+function ConvertTo-Pct {
+    param($Value)
+    $x = ConvertTo-Dbl $Value 0.0
+    if ($x -gt 0 -and $x -le 1) { return ($x * 100.0) }
+    return $x
+}
+
+# First argument unless it is empty (CSV cells are strings, so "0" counts as a value)
+function Get-FirstValue {
+    param($A, $B)
+    if ($null -ne $A -and ([string]$A).Trim() -ne "") { return $A }
+    return $B
+}
+
+function Test-ContainsAny {
+    param([string]$Text, [string[]]$Keys)
+    $t = ([string]$Text).ToLower()
+    foreach ($k in $Keys) {
+        if ($k -and $t.Contains($k.ToLower())) { return $true }
+    }
+    return $false
+}
+
+# Removes the bogus "(Pens: 255-0)" text the game engine's "no shootout" value (255) used to produce
+function Remove-PenaltyNoise {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    $s = $Text
+    $s = [regex]::Replace($s, '\s*\(Pens:\s*255-\d+\)', '', 'IgnoreCase')
+    $s = [regex]::Replace($s, '\s*\(Pens:\s*\d+-255\)', '', 'IgnoreCase')
+    $s = [regex]::Replace($s, '\s*\(Pens:\s*0-0\)', '', 'IgnoreCase')
+    $s = [regex]::Replace($s, '\b255\s*penalties\b', '0 penalties', 'IgnoreCase')
+    return $s
+}
+
+# Compacts JSON text and escapes raw control characters (a raw newline or tab) inside strings, which strict
+# JSON parsers reject. Whitespace between tokens is dropped. String-aware, so string contents are preserved.
+function ConvertTo-CompactJson {
+    param([string]$Text)
+    $sb = New-Object System.Text.StringBuilder ($Text.Length)
+    $inStr = $false
+    $esc = $false
+    foreach ($ch in $Text.ToCharArray()) {
+        $c = [int]$ch
+        if ($inStr) {
+            if ($esc) { [void]$sb.Append($ch); $esc = $false }
+            elseif ($c -eq 92) { [void]$sb.Append($ch); $esc = $true }          # backslash
+            elseif ($c -eq 34) { [void]$sb.Append($ch); $inStr = $false }       # closing quote
+            elseif ($c -lt 32) {
+                if ($c -eq 10) { [void]$sb.Append('\n') }
+                elseif ($c -eq 13) { [void]$sb.Append('\r') }
+                elseif ($c -eq 9) { [void]$sb.Append('\t') }
+                else { [void]$sb.Append(('\u{0:x4}' -f $c)) }
+            }
+            else { [void]$sb.Append($ch) }
+        } else {
+            if ($c -eq 34) { $inStr = $true; [void]$sb.Append($ch) }
+            elseif ($c -le 32) { }                                              # whitespace between tokens
+            else { [void]$sb.Append($ch) }
+        }
+    }
+    return $sb.ToString()
+}
+
+# Strict JSON-object check. Returns the parsed object, or $null when the text is not a JSON object.
+function ConvertFrom-JsonObject {
+    param([string]$Text)
+    try {
+        $o = $Text | ConvertFrom-Json -ErrorAction Stop
+        if ($o -is [System.Management.Automation.PSCustomObject]) { return $o }
+    } catch {}
+    return $null
+}
+
 # Initialize Events Cache
 $global:EventList = [System.Collections.Generic.List[string]]::new()
+$global:EventSeq = 0
+$DedupeWindowSeconds = 600
+
 if (Test-Path $EventsFile) {
     try {
-        $existing = Get-Content $EventsFile -Raw | ConvertFrom-Json
+        $existing = @(Get-Content $EventsFile -Raw -Encoding UTF8 | ConvertFrom-Json)
+        $dropped = 0
         foreach ($e in $existing) {
+            if ($null -eq $e) { continue }
+            if ($e.message -is [string]) {
+                $e.message = Remove-PenaltyNoise $e.message
+                # An old event that looks like JSON but is malformed would stall the phone app for every event
+                # after it, so it is dropped here.
+                if ($e.message.TrimStart().StartsWith("{") -and ($null -eq (ConvertFrom-JsonObject $e.message))) {
+                    $dropped++
+                    continue
+                }
+            }
             $global:EventList.Add(($e | ConvertTo-Json -Compress))
         }
         Write-Host "Loaded $($global:EventList.Count) historical events from cache." -ForegroundColor DarkGray
-    } catch {}
+        if ($dropped -gt 0) { Write-Host "  (dropped $dropped malformed stored event(s))" -ForegroundColor Yellow }
+    } catch {
+        Write-Host "Could not read $EventsFile ($($_.Exception.Message)). Starting with an empty list; the old file was kept as .corrupt" -ForegroundColor Yellow
+        try { Copy-Item -LiteralPath $EventsFile -Destination "$EventsFile.corrupt" -Force } catch {}
+        $global:EventList.Clear()
+    }
+}
+
+function Save-TelemetryEvents {
+    try {
+        $text = "[" + ($global:EventList -join ",") + "]"
+        $tmp = "$EventsFile.tmp"
+        [System.IO.File]::WriteAllText($tmp, $text, (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $EventsFile -Force
+    } catch {
+        Write-Host "  (could not save $EventsFile : $($_.Exception.Message))" -ForegroundColor Yellow
+    }
 }
 
 # Function to add event
@@ -82,9 +212,10 @@ function Add-TelemetryEvent {
         [string]$RawPayload
     )
     $timestamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $global:EventSeq++
     $formattedEvent = [PSCustomObject]@{
         event = "message"
-        id = "ev-$timestamp-" + (Get-Random -Maximum 9999)
+        id = "ev-$timestamp-$($global:EventSeq)"
         time = $timestamp
         title = $Title
         message = if ($RawPayload) { $RawPayload } else { $Message }
@@ -93,16 +224,79 @@ function Add-TelemetryEvent {
     $global:EventList.Add($jsonStr)
 
     # Keep last 100 events
-    if ($global:EventList.Count -gt 100) {
+    while ($global:EventList.Count -gt 100) {
         $global:EventList.RemoveAt(0)
     }
 
-    # Save to file
-    try {
-        "[" + ($global:EventList -join ",") + "]" | Set-Content $EventsFile -Encoding UTF8
-    } catch {}
-
+    Save-TelemetryEvents
     Write-Host "[$(Get-Date -Format 'HH:mm:ss')] TELEMETRY SAVED: $Title" -ForegroundColor Green
+}
+
+# -------------------------------------------------------------------------
+# Match de-duplication. The Lua script and the hot-folder importer can both report the same match;
+# the first one to arrive wins and the other is dropped.
+# -------------------------------------------------------------------------
+function ConvertTo-TeamKey {
+    param($Name)
+    return ([regex]::Replace(([string]$Name).ToLower(), '[^a-z0-9]', ''))
+}
+
+function Test-DuplicateMatch {
+    param([string]$Opponent, [int]$GoalsFor, [int]$GoalsAgainst, [string]$FixtureKey)
+    $opp = ConvertTo-TeamKey $Opponent
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    for ($i = $global:EventList.Count - 1; $i -ge 0; $i--) {          # newest first
+        $ev = $null
+        try { $ev = $global:EventList[$i] | ConvertFrom-Json } catch { $ev = $null }
+        if ($null -eq $ev) { continue }
+        if (($now - (ConvertTo-Int $ev.time)) -gt $DedupeWindowSeconds) { break }
+        $msg = $ev.message
+        if (($msg -isnot [string]) -or (-not $msg.TrimStart().StartsWith("{"))) { continue }
+        $other = ConvertFrom-JsonObject $msg
+        if ($null -eq $other -or $other.dataType -ne "match") { continue }
+        if ($FixtureKey -and ([string]$other.fixtureKey -eq $FixtureKey)) { return $true }
+        $oOpp = ConvertTo-TeamKey $other.opponentName
+        $sameOpponent = ($oOpp -eq $opp) -or (($opp -ne "") -and ($oOpp -ne "") -and ($opp.Contains($oOpp) -or $oOpp.Contains($opp)))
+        if ($sameOpponent -and ((ConvertTo-Int $other.goalsFor) -eq $GoalsFor) -and ((ConvertTo-Int $other.goalsAgainst) -eq $GoalsAgainst)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+# Adds a match unless the same match was reported moments ago. Returns $true when it was added.
+function Add-MatchEvent {
+    param([string]$Title, [string]$Message, [string]$RawPayload, [string]$Opponent, [int]$GoalsFor, [int]$GoalsAgainst, [string]$FixtureKey)
+    if (Test-DuplicateMatch -Opponent $Opponent -GoalsFor $GoalsFor -GoalsAgainst $GoalsAgainst -FixtureKey $FixtureKey) {
+        Write-Host "  -> (duplicate match ignored: $Message)" -ForegroundColor DarkYellow
+        return $false
+    }
+    Add-TelemetryEvent -Title $Title -Message $Message -RawPayload $RawPayload
+    return $true
+}
+
+# Reads the POST body (bounded) and decodes it. Returns $null when it is larger than $MaxBodyBytes.
+# HttpListener's ContentEncoding falls back to the Windows ANSI code page when the sender names no charset,
+# which garbles characters such as the euro sign and accented player names, so UTF-8 is tried first.
+function Read-RequestBody {
+    param($Request)
+    $ms = New-Object System.IO.MemoryStream
+    try {
+        $buf = New-Object byte[] 65536
+        while (($n = $Request.InputStream.Read($buf, 0, $buf.Length)) -gt 0) {
+            $ms.Write($buf, 0, $n)
+            if ($ms.Length -gt $MaxBodyBytes) { return $null }
+        }
+        $bytes = $ms.ToArray()
+    } finally {
+        $ms.Dispose()
+    }
+    try {
+        $text = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($bytes)
+    } catch {
+        $text = [System.Text.Encoding]::GetEncoding("iso-8859-1").GetString($bytes)
+    }
+    return $text.TrimStart([char]0xFEFF)
 }
 
 function Create-SampleMatchJson {
@@ -277,19 +471,404 @@ try {
 # PROJECT ATLAS & FC26 AUTO-CAPTURE HOT-FOLDER AUTO-INGESTER
 # Automatically watches Documents\FC26 Export for newly published match exports
 # =========================================================================
-$global:ProcessedAtlasFolders = [System.Collections.Generic.HashSet[string]]::new()
+$ProcessedAtlasFile = Join-Path $PSScriptRoot "processed_atlas_folders.json"
+$StaleExportSeconds = 600        # exports older than this at first start are never replayed
+$MaxAtlasAttempts = 3
+$global:ProcessedAtlasFolders = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$global:AtlasAttempts = @{}
+$global:AtlasFirstScan = $true
+$global:AtlasHaveState = $false
+$global:LastAtlasError = ""
+
+function Import-AtlasState {
+    try {
+        if (Test-Path -LiteralPath $ProcessedAtlasFile) {
+            $items = @(Get-Content -LiteralPath $ProcessedAtlasFile -Raw -Encoding UTF8 | ConvertFrom-Json)
+            foreach ($i in $items) { if ($i) { [void]$global:ProcessedAtlasFolders.Add([string]$i) } }
+            $global:AtlasHaveState = $true
+        }
+    } catch {
+        Write-Host "[PROJECT ATLAS] could not read $ProcessedAtlasFile : $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+function Save-AtlasState {
+    try {
+        $names = @($global:ProcessedAtlasFolders | Sort-Object)
+        if ($names.Count -gt 500) { $names = $names[($names.Count - 500)..($names.Count - 1)] }
+        $parts = foreach ($n in $names) { '"' + ($n -replace '\\', '\\' -replace '"', '\"') + '"' }
+        $text = "[" + (@($parts) -join ",") + "]"
+        [System.IO.File]::WriteAllText($ProcessedAtlasFile, $text, (New-Object System.Text.UTF8Encoding($false)))
+    } catch {}
+}
+
+# Lua scripts and the Atlas exporters write to %USERPROFILE%\Documents\FC26 Export. Windows can redirect the real
+# "Documents" folder to OneDrive, so every plausible location is watched, not just the shell's idea of Documents.
+function Get-AtlasRoots {
+    $cands = @()
+    if ($env:USERPROFILE) { $cands += (Join-Path $env:USERPROFILE "Documents\FC26 Export") }
+    try { $cands += (Join-Path ([Environment]::GetFolderPath("MyDocuments")) "FC26 Export") } catch {}
+    if ($env:OneDrive) { $cands += (Join-Path $env:OneDrive "Documents\FC26 Export") }
+    $roots = @()
+    foreach ($c in $cands) {
+        if ($c -and ($roots -notcontains $c) -and (Test-Path -LiteralPath $c)) { $roots += $c }
+    }
+    return $roots
+}
+
+# Reads a CSV as UTF-8 (BOM or not; Windows PowerShell 5.1 would otherwise read it as ANSI and mangle names).
+# -Required makes a failure throw so the importer retries instead of building an empty match.
+function Read-CsvRows {
+    param([string]$Path, [switch]$Required)
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) {
+            if ($Required) { throw "missing file $Path" }
+            return @()
+        }
+        return @(Import-Csv -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop)
+    } catch {
+        if ($Required) { throw }
+        Write-Host "  (could not read $(Split-Path $Path -Leaf): $($_.Exception.Message))" -ForegroundColor DarkYellow
+        return @()
+    }
+}
+
+function Import-AtlasFolder {
+    param([string]$Folder, [string]$FolderId, [string]$SnapshotsReady)
+
+    $participantsCsv = Join-Path $Folder "16_match_participants_wide.csv"
+    $teamsCsv = Join-Path $Folder "18_match_teams_wide.csv"
+
+    Write-Host ""
+    Write-Host "[PROJECT ATLAS] 🎯 New MatchStats export detected: $FolderId" -ForegroundColor Cyan
+
+    # Match context from Snapshots
+    $oppName = "Opponent"
+    $managedClubName = "My Club"
+    $managedTeamId = 0
+    $currentLeagueName = "League"
+    $compName = "League Match"
+    $isHome = $true
+    $managedScore = 0
+    $opponentScore = 0
+    $resultBadge = "W"
+    $matchDate = (Get-Date -Format "yyyy-MM-dd")
+    $leaguePos = 0
+    $completedMatches = @()
+    $latest = $null
+    $managedSquadPlayerIds = [System.Collections.Generic.HashSet[int]]::new()
+
+    if ($SnapshotsReady -and (Test-Path -LiteralPath $SnapshotsReady)) {
+        $snapFolders = @(Get-ChildItem -LiteralPath $SnapshotsReady -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+        if ($snapFolders.Count -gt 0) {
+            $latestSnap = $snapFolders[0].FullName
+
+            foreach ($m in (Read-CsvRows (Join-Path $latestSnap "career_metadata.csv"))) {
+                if ($m.key -eq "managed_team_id" -and $m.value) { $managedTeamId = ConvertTo-Int $m.value $managedTeamId }
+                if ($m.key -eq "managed_team_name" -and $m.value) { $managedClubName = [string]$m.value }
+            }
+
+            $snapMatches = @(Read-CsvRows (Join-Path $latestSnap "managed_team_matches.csv"))
+            $completedMatches = @($snapMatches | Where-Object { ([string]$_.is_completed).Trim() -eq "1" })
+            if ($completedMatches.Count -gt 0) {
+                $latest = $completedMatches[-1]
+                if ($latest.managed_team_id) { $managedTeamId = ConvertTo-Int $latest.managed_team_id $managedTeamId }
+                if ($latest.managed_team_name) { $managedClubName = [string]$latest.managed_team_name }
+                if ($latest.opponent_team_name) { $oppName = [string]$latest.opponent_team_name }
+                $isHome = (([string]$latest.side).ToUpper() -eq "HOME") -or (([string]$latest.managed_team_side).ToUpper() -eq "HOME")
+                $managedScore = ConvertTo-Int $latest.managed_score
+                $opponentScore = ConvertTo-Int $latest.opponent_score
+                if ($latest.result) { $resultBadge = [string]$latest.result }
+                elseif ($latest.managed_team_result) { $resultBadge = [string]$latest.managed_team_result }
+                elseif ($managedScore -gt $opponentScore) { $resultBadge = "W" }
+                elseif ($managedScore -eq $opponentScore) { $resultBadge = "D" }
+                else { $resultBadge = "L" }
+                if ($latest.date) { $matchDate = [string]$latest.date }
+            }
+
+            # Primary domestic league = the managed team's row with the most matches played (team_leagues.csv)
+            $bestPld = -1
+            foreach ($tl in (Read-CsvRows (Join-Path $latestSnap "team_leagues.csv"))) {
+                $tlTid = ConvertTo-Int $tl.team_id
+                $tlTname = [string]$tl.team_name
+                if ($tlTid -eq $managedTeamId -or ($managedClubName -and $tlTname.ToLower().Contains($managedClubName.ToLower()))) {
+                    $pld = ConvertTo-Int $tl.matches_played
+                    $pos = ConvertTo-Int $tl.current_table_position
+                    if ($pld -gt $bestPld -and $pos -gt 0) {
+                        $bestPld = $pld
+                        $leaguePos = $pos
+                        if ($tl.league_name) { $currentLeagueName = [string]$tl.league_name }
+                    } elseif ($bestPld -eq -1 -and $pos -gt 0) {
+                        $leaguePos = $pos
+                        if ($tl.league_name) { $currentLeagueName = [string]$tl.league_name }
+                    }
+                }
+            }
+
+            # Managed squad player ids, used to work out which participant team index is ours
+            foreach ($r in (Read-CsvRows (Join-Path $latestSnap "rosters.csv"))) {
+                if ((ConvertTo-Int $r.team_id) -eq $managedTeamId -and $r.player_id) {
+                    [void]$managedSquadPlayerIds.Add((ConvertTo-Int $r.player_id))
+                }
+            }
+        }
+    }
+
+    # Competition & stage
+    $rawComp = if ($latest -and $latest.competition_name) { [string]$latest.competition_name } else { $currentLeagueName }
+    $leagueKeys = @($currentLeagueName.ToLower(), "league", "championship", "division", "premier")
+    $playoffKeys = @("play-off", "playoff", "promotion")
+    $isPlayoff = Test-ContainsAny $rawComp $playoffKeys
+    $isRegularLeague = (-not $isPlayoff) -and (Test-ContainsAny $rawComp $leagueKeys) -and (-not (Test-ContainsAny $rawComp @("cup", "fa", "carabao", "trophy")))
+
+    if ($isPlayoff) {
+        $compName = $currentLeagueName
+        $playoffMatches = @($completedMatches | Where-Object { Test-ContainsAny ([string]$_.competition_name) $playoffKeys })
+        $pCount = [Math]::Max(1, $playoffMatches.Count)
+        if ($pCount -ge 3) { $stageVal = "Play-off Final" }
+        elseif ($pCount -eq 2) { $stageVal = "Play-off Semi-Final (Leg 2)" }
+        else { $stageVal = "Play-off Semi-Final (Leg 1)" }
+    } elseif ($isRegularLeague) {
+        $compName = $currentLeagueName
+        $leagueMatches = @($completedMatches | Where-Object {
+            $c = [string]$_.competition_name
+            (Test-ContainsAny $c $leagueKeys) -and (-not (Test-ContainsAny $c @("play-off", "playoff", "cup", "fa", "carabao", "trophy")))
+        })
+        $stageVal = "Matchday $([Math]::Max(1, $leagueMatches.Count))"
+    } else {
+        $compName = $rawComp
+        $cupMatches = @($completedMatches | Where-Object { ([string]$_.competition_name) -eq $rawComp })
+        $cCount = [Math]::Max(1, $cupMatches.Count)
+        $rcl = $rawComp.ToLower()
+        if ($rcl.Contains("fa cup") -or $rcl.Contains("emirates")) {
+            if ($cCount -ge 6) { $stageVal = "Final" }
+            elseif ($cCount -eq 5) { $stageVal = "Semi-Final" }
+            elseif ($cCount -eq 4) { $stageVal = "Quarter-Final" }
+            elseif ($cCount -eq 3) { $stageVal = "Round 5" }
+            elseif ($cCount -eq 2) { $stageVal = "Round 4" }
+            else { $stageVal = "Round 3" }
+        } elseif ($rcl.Contains("carabao") -or $rcl.Contains("efl cup")) {
+            if ($cCount -ge 6) { $stageVal = "Final" }
+            elseif ($cCount -eq 5) { $stageVal = "Semi-Final" }
+            elseif ($cCount -eq 4) { $stageVal = "Quarter-Final" }
+            else { $stageVal = "Round $cCount" }
+        } else {
+            $stageVal = "Round $cCount"
+        }
+    }
+
+    # Participants (a failure here must throw so the folder is retried, not imported empty)
+    $participants = @(Read-CsvRows $participantsCsv -Required)
+    $count0 = 0
+    $count1 = 0
+    $maxMinutes = 0
+    foreach ($p in $participants) {
+        $rowPlayerId = ConvertTo-Int $p.player_id
+        $pTeam = ConvertTo-Int $p.team_index
+        $pMins = ConvertTo-Int $p.minutes_played
+        if ($pMins -gt $maxMinutes) { $maxMinutes = $pMins }
+        if ($managedSquadPlayerIds.Contains($rowPlayerId)) {
+            if ($pTeam -eq 0) { $count0++ } else { $count1++ }
+        }
+    }
+
+    if ($count0 -gt $count1) { $managedTeamIndex = 0; $oppTeamIndex = 1 }
+    elseif ($count1 -gt $count0) { $managedTeamIndex = 1; $oppTeamIndex = 0 }
+    else {
+        $managedTeamIndex = if ($isHome) { 0 } else { 1 }
+        $oppTeamIndex = if ($managedTeamIndex -eq 0) { 1 } else { 0 }
+    }
+
+    # Team totals (18_match_teams_wide.csv)
+    $teamRows = @(Read-CsvRows $teamsCsv -Required)
+    $mTeam = $null
+    $oTeam = $null
+    if ($teamRows.Count -gt $managedTeamIndex) { $mTeam = $teamRows[$managedTeamIndex] } elseif ($teamRows.Count -gt 0) { $mTeam = $teamRows[0] }
+    if ($teamRows.Count -gt $oppTeamIndex) { $oTeam = $teamRows[$oppTeamIndex] } elseif ($teamRows.Count -gt 1) { $oTeam = $teamRows[1] }
+
+    # Extra time & penalties
+    $isPlayoffLeg1 = $isPlayoff -and $stageVal.ToLower().Contains("leg 1")
+    if ($isRegularLeague -or $isPlayoffLeg1) {
+        $isExtraTime = $false
+        $homePen = 0
+        $awayPen = 0
+    } else {
+        $mShootout = ConvertTo-Int $mTeam.shootout_goals
+        $oShootout = ConvertTo-Int $oTeam.shootout_goals
+        if ($mShootout -ge 255 -or $mShootout -lt 0) { $mShootout = 0 }
+        if ($oShootout -ge 255 -or $oShootout -lt 0) { $oShootout = 0 }
+        # Extra time happened only if someone played >= 115 minutes or there was a shootout
+        $isExtraTime = ($maxMinutes -ge 115) -or ($mShootout -gt 0) -or ($oShootout -gt 0)
+        if ($isHome) { $homePen = $mShootout; $awayPen = $oShootout }
+        else { $homePen = $oShootout; $awayPen = $mShootout }
+    }
+    if ($homePen -ge 255 -or $homePen -lt 0) { $homePen = 0 }
+    if ($awayPen -ge 255 -or $awayPen -lt 0) { $awayPen = 0 }
+
+    # Man of the match straight from the game's own flag, else the best rating
+    $topPlayer = ""
+    $highestRating = -1.0
+    foreach ($p in $participants) {
+        $r = ConvertTo-Dbl $p.game_rating 6.0
+        $motmFlag = ([string]$p.man_of_the_match).Trim().ToLower()
+        if (($motmFlag -eq "true" -or $motmFlag -eq "1") -and $p.player_name) {
+            $topPlayer = [string]$p.player_name
+            break
+        }
+        if ($r -gt $highestRating -and $p.player_name) {
+            $highestRating = $r
+            $topPlayer = [string]$p.player_name
+        }
+    }
+
+    $shotsFor = ConvertTo-Int (Get-FirstValue $mTeam.shots $mTeam.shots_on_target)
+    $shotsAgainst = ConvertTo-Int (Get-FirstValue $oTeam.shots $oTeam.shots_on_target)
+    $xGF = ConvertTo-Dbl $mTeam.npk_expected_goals
+    $xGA = ConvertTo-Dbl $oTeam.npk_expected_goals
+    $passesFor = ConvertTo-Int $mTeam.passes
+    $passesAgainst = ConvertTo-Int $oTeam.passes
+    $passAcc = ConvertTo-Int (ConvertTo-Pct $mTeam.pass_accuracy_pct_derived)
+    $possession = ConvertTo-Int (ConvertTo-Pct (Get-FirstValue $mTeam.possession $mTeam.possession_pct))
+    if ($possession -le 0 -and ($passesFor + $passesAgainst) -gt 0) {
+        $possession = [int][Math]::Floor(($passesFor / ($passesFor + $passesAgainst)) * 100)
+    }
+    if ($possession -le 0) { $possession = 52 }
+
+    # Player performances - only players who actually played (the export lists the whole matchday squad)
+    $playerPerfs = @()
+    $goalPlayers = @()
+    foreach ($p in $participants) {
+        $pTeam = ConvertTo-Int $p.team_index
+        $pMinutes = ConvertTo-Dbl $p.minutes_played -1.0
+        $played = -not ($maxMinutes -gt 0 -and $pMinutes -ge 0 -and $pMinutes -le 0)
+        if ($pTeam -ne $managedTeamIndex -or -not $played) { continue }
+
+        $pName = if ($p.player_name) { [string]$p.player_name } else { "Player" }
+        $pGoals = ConvertTo-Int (Get-FirstValue $p.goals_derived $p.npk_goals)
+        $pAssists = ConvertTo-Int $p.assists
+        $pRating = ConvertTo-Dbl $p.game_rating 6.5
+        $pPasses = ConvertTo-Int $p.passes
+        $pPassAcc = ConvertTo-Int (ConvertTo-Pct $p.pass_accuracy_pct_derived)
+        $pShots = ConvertTo-Int (Get-FirstValue $p.shots $pGoals)
+        $pShotAcc = 0
+        if ($pShots -gt 0) {
+            $pShotAcc = [Math]::Min(100, [int][Math]::Floor(((ConvertTo-Int $p.shots_on_target) / [Math]::Max(1, $pShots)) * 100))
+        }
+        $pTackles = ConvertTo-Int $p.tackles
+        if ((ConvertTo-Dbl $p.stand_tackle_success_pct_derived -1.0) -ge 0) {
+            $pTacklePct = ConvertTo-Int (ConvertTo-Pct $p.stand_tackle_success_pct_derived)
+        } elseif ($pTackles -gt 0) {
+            $pTacklePct = [Math]::Min(100, [int][Math]::Floor(((ConvertTo-Dbl $p.tackles_completed $pTackles) / $pTackles) * 100))
+        } else {
+            $pTacklePct = 0
+        }
+        $pMotmFlag = ([string]$p.man_of_the_match).Trim().ToLower()
+        $isMotm = ($pName -eq $topPlayer) -or ($pMotmFlag -eq "true") -or ($pMotmFlag -eq "1")
+
+        $playerPerfs += [PSCustomObject]@{
+            playerId = [string]$p.player_id
+            playerName = $pName
+            rating = [Math]::Round($pRating, 1)
+            goals = $pGoals
+            assists = $pAssists
+            passes = $pPasses
+            passAccuracy = $pPassAcc
+            shots = $pShots
+            shotAccuracy = $pShotAcc
+            tackles = $pTackles
+            tacklePercentage = $pTacklePct
+            interceptions = (ConvertTo-Int $p.interceptions)
+            cleanSheet = ($opponentScore -eq 0)
+            yellowCard = ((ConvertTo-Int $p.yellow_card_events) -gt 0)
+            redCard = ((ConvertTo-Int $p.red_dismissals) -gt 0)
+            isMotm = $isMotm
+        }
+
+        for ($g = 0; $g -lt $pGoals; $g++) { $goalPlayers += $pName }
+    }
+
+    # The export has no goal minutes: spread them evenly over the match and flag them as estimated.
+    $goalDetails = @()
+    for ($k = 1; $k -le $goalPlayers.Count; $k++) {
+        $goalDetails += [PSCustomObject]@{
+            playerName = $goalPlayers[$k - 1]
+            minute = [Math]::Max(1, [Math]::Min(90, [int][Math]::Floor(90 * $k / ($goalPlayers.Count + 1))))
+            isOpponent = $false
+            minuteEstimated = $true
+        }
+    }
+    for ($og = 1; $og -le $opponentScore; $og++) {
+        $goalDetails += [PSCustomObject]@{
+            playerName = "$oppName Goal"
+            minute = [Math]::Max(1, [Math]::Min(90, [int][Math]::Floor(90 * $og / ($opponentScore + 1))))
+            isOpponent = $true
+            minuteEstimated = $true
+        }
+    }
+
+    $etStr = ""
+    if ($homePen -gt 0 -or $awayPen -gt 0) { $etStr = " (Pens: $homePen-$awayPen)" }
+    elseif ($isExtraTime) { $etStr = " (A.E.T.)" }
+    $locSymbol = if ($isHome) { "vs" } else { "@" }
+    $msg = "Full Time: $managedClubName $locSymbol $managedScore - $opponentScore $oppName ($compName - $stageVal)$etStr"
+
+    $leaguePosOut = $null
+    if ($leaguePos -gt 0) { $leaguePosOut = $leaguePos }
+
+    $matchPayload = [PSCustomObject]@{
+        dataType = "match"
+        title = "Live Match Final"
+        message = $msg
+        opponentName = $oppName
+        isHome = $isHome
+        goalsFor = $managedScore
+        goalsAgainst = $opponentScore
+        resultBadge = $resultBadge
+        date = $matchDate
+        competition = $compName
+        stage = $stageVal
+        isExtraTime = $isExtraTime
+        homePenalties = $homePen
+        awayPenalties = $awayPen
+        shotsFor = $shotsFor
+        shotsAgainst = $shotsAgainst
+        possession = $possession
+        passingAccuracy = $passAcc
+        expectedGoals = [Math]::Round($xGF, 2)
+        expectedGoalsAgainst = [Math]::Round($xGA, 2)
+        motmName = $topPlayer
+        leaguePosition = $leaguePosOut
+        detailSource = "atlas"
+        playerPerformances = $playerPerfs
+        goalDetails = $goalDetails
+    }
+
+    $jsonPayload = $matchPayload | ConvertTo-Json -Depth 6 -Compress
+    $added = Add-MatchEvent -Title "Live Match Final" -Message $msg -RawPayload $jsonPayload -Opponent $oppName -GoalsFor $managedScore -GoalsAgainst $opponentScore -FixtureKey ""
+    if ($added) {
+        Write-Host "  -> ⚽ Imported Match: $msg" -ForegroundColor Green
+        Write-Host "     xG: $([Math]::Round($xGF, 2)) - $([Math]::Round($xGA, 2)) | MOTM: $topPlayer | Lineup: $($playerPerfs.Count) players" -ForegroundColor Yellow
+    }
+}
 
 function Check-AtlasExportFolder {
     try {
-        $docs = [Environment]::GetFolderPath("MyDocuments")
-        $atlasRoot = Join-Path $docs "FC26 Export"
-        if (-not (Test-Path $atlasRoot)) { return }
+        foreach ($atlasRoot in (Get-AtlasRoots)) {
+            $matchStatsReady = Join-Path $atlasRoot "MatchStats\ready"
+            $snapshotsReady = Join-Path $atlasRoot "Snapshots\ready"
+            if (-not (Test-Path -LiteralPath $matchStatsReady)) { continue }
 
-        $matchStatsReady = Join-Path $atlasRoot "MatchStats\ready"
-        $snapshotsReady = Join-Path $atlasRoot "Snapshots\ready"
+            $folders = @(Get-ChildItem -LiteralPath $matchStatsReady -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
 
-        if (Test-Path $matchStatsReady) {
-            $folders = @(Get-ChildItem -Path $matchStatsReady -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+            if ($global:AtlasFirstScan -and -not $global:AtlasHaveState) {
+                # First start: exports from earlier matches must not be replayed into the app.
+                $cutoff = (Get-Date).AddSeconds(-$StaleExportSeconds)
+                foreach ($f in $folders) {
+                    if ($f.LastWriteTime -lt $cutoff) { [void]$global:ProcessedAtlasFolders.Add($f.Name) }
+                }
+                Save-AtlasState
+            }
+
             foreach ($folder in $folders) {
                 $folderId = $folder.Name
                 if ($global:ProcessedAtlasFolders.Contains($folderId)) { continue }
@@ -299,342 +878,39 @@ function Check-AtlasExportFolder {
                 $participantsCsv = Join-Path $folder.FullName "16_match_participants_wide.csv"
                 $teamsCsv = Join-Path $folder.FullName "18_match_teams_wide.csv"
 
-                if ((Test-Path $readyMarker -or Test-Path $altMarker) -and (Test-Path $participantsCsv) -and (Test-Path $teamsCsv)) {
-                    Write-Host ""
-                    Write-Host "[PROJECT ATLAS] 🎯 New MatchStats export detected: $folderId" -ForegroundColor Cyan
-
-                    # Match context from Snapshots
-                    $oppName = "Opponent"
-                    $managedClubName = "My Club"
-                    $managedTeamId = 0
-                    $currentLeagueName = "League"
-                    $compName = "League Match"
-                    $isHome = $true
-                    $managedScore = 0
-                    $opponentScore = 0
-                    $resultBadge = "W"
-                    $matchDate = (Get-Date -Format "yyyy-MM-dd")
-                    $currentTablePos = 0
-                    $completedMatches = @()
-                    $homePen = 0
-                    $awayPen = 0
-                    $isExtraTime = $false
-                    $managedSquadPlayerIds = [System.Collections.Generic.HashSet[int]]::new()
-
-                    if (Test-Path $snapshotsReady) {
-                        $snapFolders = @(Get-ChildItem -Path $snapshotsReady -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
-                        if ($snapFolders.Count -gt 0) {
-                            $latestSnap = $snapFolders[0].FullName
-                            $managedMatchesFile = Join-Path $latestSnap "managed_team_matches.csv"
-                            $teamLeaguesFile = Join-Path $latestSnap "team_leagues.csv"
-                            $metaFile = Join-Path $latestSnap "career_metadata.csv"
-                            $rostersFile = Join-Path $latestSnap "rosters.csv"
-
-                            if (Test-Path $metaFile) {
-                                $metaRows = @(Import-Csv -Path $metaFile -ErrorAction SilentlyContinue)
-                                foreach ($m in $metaRows) {
-                                    if ($m.key -eq "managed_team_id" -and $m.value) { $managedTeamId = [int]$m.value }
-                                    if ($m.key -eq "managed_team_name" -and $m.value) { $managedClubName = $m.value }
-                                }
-                            }
-
-                            if (Test-Path $managedMatchesFile) {
-                                $snapMatches = @(Import-Csv -Path $managedMatchesFile -ErrorAction SilentlyContinue)
-                                $completedMatches = @($snapMatches | Where-Object { $_.is_completed -eq "1" -or $_.is_completed -eq 1 })
-                                if ($completedMatches.Count -gt 0) {
-                                    $latest = $completedMatches[-1]
-                                    if ($latest.managed_team_id) { $managedTeamId = [int]$latest.managed_team_id }
-                                    if ($latest.managed_team_name) { $managedClubName = $latest.managed_team_name }
-                                    if ($latest.opponent_team_name) { $oppName = $latest.opponent_team_name }
-                                    $isHome = ($latest.side -eq "HOME" -or $latest.managed_team_side -eq "HOME")
-                                    $managedScore = [int]($latest.managed_score)
-                                    $opponentScore = [int]($latest.opponent_score)
-                                    $resultBadge = if ($latest.result) { $latest.result } elseif ($latest.managed_team_result) { $latest.managed_team_result } else { if ($managedScore -gt $opponentScore) { "W" } elseif ($managedScore -eq $opponentScore) { "D" } else { "L" } }
-                                    if ($latest.date) { $matchDate = $latest.date }
-                                }
-                            }
-
-                            # Extract Primary Domestic League from team_leagues.csv (highest matches_played)
-                            if (Test-Path $teamLeaguesFile) {
-                                $tlRows = @(Import-Csv -Path $teamLeaguesFile -ErrorAction SilentlyContinue)
-                                $bestPld = -1
-                                foreach ($tl in $tlRows) {
-                                    $tlTid = if ($tl.team_id) { [int]$tl.team_id } else { 0 }
-                                    $tlTname = if ($tl.team_name) { $tl.team_name } else { "" }
-                                    if ($tlTid -eq $managedTeamId -or ($managedClubName -and $tlTname -like "*$managedClubName*")) {
-                                        $pld = if ($tl.matches_played) { [int]$tl.matches_played } else { 0 }
-                                        $pos = if ($tl.current_table_position) { [int]$tl.current_table_position } else { 0 }
-                                        if ($pld -gt $bestPld -and $pos -gt 0) {
-                                            $bestPld = $pld
-                                            $currentTablePos = $pos
-                                            if ($tl.league_name) { $currentLeagueName = $tl.league_name }
-                                        } elseif ($bestPld -eq -1 -and $pos -gt 0) {
-                                            $currentTablePos = $pos
-                                            if ($tl.league_name) { $currentLeagueName = $tl.league_name }
-                                        }
-                                    }
-                                }
-                            }
-
-                            # Cache Managed Squad Player IDs to robustly match participant team index
-                            if (Test-Path $rostersFile) {
-                                $rosterRows = @(Import-Csv -Path $rostersFile -ErrorAction SilentlyContinue)
-                                foreach ($r in $rosterRows) {
-                                    if ($r.team_id -and [int]$r.team_id -eq $managedTeamId) {
-                                        $managedSquadPlayerIds.Add([int]$r.player_id) | Out-Null
-                                    }
-                                }
-                            }
+                if (((Test-Path -LiteralPath $readyMarker) -or (Test-Path -LiteralPath $altMarker)) -and (Test-Path -LiteralPath $participantsCsv) -and (Test-Path -LiteralPath $teamsCsv)) {
+                    try {
+                        Import-AtlasFolder -Folder $folder.FullName -FolderId $folderId -SnapshotsReady $snapshotsReady
+                        [void]$global:ProcessedAtlasFolders.Add($folderId)
+                        Save-AtlasState
+                    } catch {
+                        $n = 1
+                        if ($global:AtlasAttempts.ContainsKey($folderId)) { $n = $global:AtlasAttempts[$folderId] + 1 }
+                        $global:AtlasAttempts[$folderId] = $n
+                        Write-Host "[PROJECT ATLAS] ⚠️ Could not import $folderId (attempt $n/$MaxAtlasAttempts): $($_.Exception.Message)" -ForegroundColor Yellow
+                        Write-Host "   $($_.ScriptStackTrace)" -ForegroundColor DarkGray
+                        if ($n -ge $MaxAtlasAttempts) {
+                            Write-Host "[PROJECT ATLAS] Giving up on $folderId; the Lua script still sends the match directly." -ForegroundColor Yellow
+                            [void]$global:ProcessedAtlasFolders.Add($folderId)
+                            Save-AtlasState
                         }
                     }
-
-                    # Determine Competition & Stage logic
-                    $rawComp = if ($latest -and $latest.competition_name) { $latest.competition_name } else { $currentLeagueName }
-                    $isPlayoff = ($rawComp -like "*Play-off*" -or $rawComp -like "*Playoff*" -or $rawComp -like "*Promotion*")
-                    $isRegularLeague = (-not $isPlayoff) -and (
-                        $rawComp -like "*$currentLeagueName*" -or
-                        $rawComp -like "*League*" -or
-                        $rawComp -like "*Championship*" -or
-                        $rawComp -like "*Division*" -or
-                        $rawComp -like "*Premier*"
-                    ) -and ($rawComp -notlike "*Cup*") -and ($rawComp -notlike "*FA*") -and ($rawComp -notlike "*Carabao*") -and ($rawComp -notlike "*Trophy*")
-
-                    $stageVal = "Matchday 1"
-                    if ($isPlayoff) {
-                        # The competition should STILL be the league the team is currently in, and the stage should be Playoff
-                        $compName = $currentLeagueName
-                        $playoffMatches = @($completedMatches | Where-Object { $_.competition_name -like "*Play-off*" -or $_.competition_name -like "*Playoff*" -or $_.competition_name -like "*Promotion*" })
-                        $pCount = [Math]::Max(1, $playoffMatches.Count)
-                        if ($pCount -ge 3) {
-                            $stageVal = "Play-off Final"
-                        } elseif ($pCount -eq 2) {
-                            $stageVal = "Play-off Semi-Final (Leg 2)"
-                        } else {
-                            $stageVal = "Play-off Semi-Final (Leg 1)"
-                        }
-                    } elseif ($isRegularLeague) {
-                        $compName = $currentLeagueName
-                        $leagueMatches = @($completedMatches | Where-Object {
-                            $c = $_.competition_name
-                            ($c -like "*$currentLeagueName*" -or $c -like "*League*" -or $c -like "*Championship*" -or $c -like "*Division*" -or $c -like "*Premier*") -and
-                            ($c -notlike "*Play-off*") -and ($c -notlike "*Playoff*") -and ($c -notlike "*Cup*") -and ($c -notlike "*FA*") -and ($c -notlike "*Carabao*") -and ($c -notlike "*Trophy*")
-                        })
-                        $count = [Math]::Max(1, $leagueMatches.Count)
-                        $stageVal = "Matchday $count"
-                        $homePen = 0
-                        $awayPen = 0
-                        $isExtraTime = $false
-                    } else {
-                        # Cup Match (FA Cup, Carabao Cup, etc.)
-                        $compName = $rawComp
-                        $cupMatches = @($completedMatches | Where-Object { $_.competition_name -eq $rawComp })
-                        $cCount = [Math]::Max(1, $cupMatches.Count)
-                        if ($rawComp -like "*FA Cup*" -or $rawComp -like "*Emirates*") {
-                            if ($cCount -ge 6) { $stageVal = "Final" }
-                            elseif ($cCount -eq 5) { $stageVal = "Semi-Final" }
-                            elseif ($cCount -eq 4) { $stageVal = "Quarter-Final" }
-                            elseif ($cCount -eq 3) { $stageVal = "Round 5" }
-                            elseif ($cCount -eq 2) { $stageVal = "Round 4" }
-                            else { $stageVal = "Round 3" }
-                        } elseif ($rawComp -like "*Carabao*" -or $rawComp -like "*EFL Cup*") {
-                            if ($cCount -ge 6) { $stageVal = "Final" }
-                            elseif ($cCount -eq 5) { $stageVal = "Semi-Final" }
-                            elseif ($cCount -eq 4) { $stageVal = "Quarter-Final" }
-                            else { $stageVal = "Round $cCount" }
-                        } else {
-                            $stageVal = "Round $cCount"
-                        }
-                    }
-
-                    # Parse participants and identify which team index (0 or 1) belongs to the managed squad
-                    $participants = @(Import-Csv -Path $participantsCsv -ErrorAction SilentlyContinue)
-                    $count0 = 0
-                    $count1 = 0
-                    $maxMinutes = 0
-                    foreach ($p in $participants) {
-                        $pId = if ($p.player_id) { [int]$p.player_id } else { 0 }
-                        $pTeam = if ($p.team_index) { [int]$p.team_index } else { 0 }
-                        $pMins = if ($p.minutes_played) { [int]$p.minutes_played } else { 0 }
-                        if ($pMins -gt $maxMinutes) { $maxMinutes = $pMins }
-                        if ($managedSquadPlayerIds.Contains($pId)) {
-                            if ($pTeam -eq 0) { $count0++ } else { $count1++ }
-                        }
-                    }
-
-                    if ($count0 -gt $count1) {
-                        $managedTeamIndex = 0
-                        $oppTeamIndex = 1
-                    } elseif ($count1 -gt $count0) {
-                        $managedTeamIndex = 1
-                        $oppTeamIndex = 0
-                    } else {
-                        $managedTeamIndex = if ($isHome) { 0 } else { 1 }
-                        $oppTeamIndex = if ($managedTeamIndex -eq 0) { 1 } else { 0 }
-                    }
-
-                    # Parse real team totals from 18_match_teams_wide.csv
-                    $teamRows = @(Import-Csv -Path $teamsCsv -ErrorAction SilentlyContinue)
-                    $managedTeamRow = if ($teamRows.Count -gt $managedTeamIndex) { $teamRows[$managedTeamIndex] } else { $teamRows[0] }
-                    $opponentTeamRow = if ($teamRows.Count -gt $oppTeamIndex) { $teamRows[$oppTeamIndex] } else { $teamRows[1] }
-
-                    # Real Extra Time & Penalties extraction
-                    $isPlayoffLeg1 = $isPlayoff -and ($stageVal -like "*Leg 1*")
-                    if ($isRegularLeague -or $isPlayoffLeg1) {
-                        $isExtraTime = $false
-                        $homePen = 0
-                        $awayPen = 0
-                    } else {
-                        $mShootout = if ($managedTeamRow -and $managedTeamRow.shootout_goals) { [int]$managedTeamRow.shootout_goals } else { 0 }
-                        $oShootout = if ($opponentTeamRow -and $opponentTeamRow.shootout_goals) { [int]$opponentTeamRow.shootout_goals } else { 0 }
-                        if ($mShootout -ge 255 -or $mShootout -lt 0) { $mShootout = 0 }
-                        if ($oShootout -ge 255 -or $oShootout -lt 0) { $oShootout = 0 }
-                        # In cups / playoffs: Extra time occurred ONLY if players logged >= 115 minutes or penalty shootout took place
-                        $isExtraTime = ($maxMinutes -ge 115) -or ($mShootout -gt 0 -or $oShootout -gt 0)
-                        if ($isHome) {
-                            $homePen = $mShootout
-                            $awayPen = $oShootout
-                        } else {
-                            $homePen = $oShootout
-                            $awayPen = $mShootout
-                        }
-                    }
-                    if ($homePen -ge 255 -or $homePen -lt 0) { $homePen = 0 }
-                    if ($awayPen -ge 255 -or $awayPen -lt 0) { $awayPen = 0 }
-
-                    # Determine Real Man of the Match directly from the engine flag
-                    $topPlayer = ""
-                    $highestRating = -1.0
-                    foreach ($p in $participants) {
-                        $pRating = if ($p.game_rating) { [double]$p.game_rating } else { 6.0 }
-                        $isOfficialMotm = ($p.man_of_the_match -eq "true" -or $p.man_of_the_match -eq 1 -or $p.man_of_the_match -eq "1")
-                        if ($isOfficialMotm -and $p.player_name) {
-                            $topPlayer = $p.player_name
-                            break
-                        }
-                        if ($pRating -gt $highestRating -and $p.player_name) {
-                            $highestRating = $pRating
-                            $topPlayer = $p.player_name
-                        }
-                    }
-
-                    $shotsFor = if ($managedTeamRow -and $managedTeamRow.shots) { [int]$managedTeamRow.shots } else { [int]$managedScore }
-                    $shotsAgainst = if ($opponentTeamRow -and $opponentTeamRow.shots) { [int]$opponentTeamRow.shots } else { [int]$opponentScore }
-                    $xGF = if ($managedTeamRow -and $managedTeamRow.npk_expected_goals) { [double]$managedTeamRow.npk_expected_goals } else { 0.0 }
-                    $xGA = if ($opponentTeamRow -and $opponentTeamRow.npk_expected_goals) { [double]$opponentTeamRow.npk_expected_goals } else { 0.0 }
-                    $passesFor = if ($managedTeamRow -and $managedTeamRow.passes) { [int]$managedTeamRow.passes } else { 0 }
-                    $passesAgainst = if ($opponentTeamRow -and $opponentTeamRow.passes) { [int]$opponentTeamRow.passes } else { 0 }
-                    $passAcc = if ($managedTeamRow -and $managedTeamRow.pass_accuracy_pct_derived) { [int][double]$managedTeamRow.pass_accuracy_pct_derived } else { 0 }
-                    $possession = if ($managedTeamRow -and $managedTeamRow.possession) { [int][double]$managedTeamRow.possession } `
-                                  elseif ($managedTeamRow -and $managedTeamRow.possession_pct) { [int][double]$managedTeamRow.possession_pct } `
-                                  elseif (($passesFor + $passesAgainst) -gt 0) { [int](($passesFor / ($passesFor + $passesAgainst)) * 100) } `
-                                  else { 50 }
-
-                    # Parse real player performances from 16_match_participants_wide.csv
-                    $playerPerfs = @()
-                    $goalDetails = @()
-
-                    foreach ($p in $participants) {
-                        $pTeam = [int]$p.team_index
-                        if ($pTeam -eq $managedTeamIndex) {
-                            $pName = $p.player_name
-                            $pId = $p.player_id
-                            $pGoals = if ($p.goals_derived) { [int]$p.goals_derived } elseif ($p.npk_goals) { [int]$p.npk_goals } else { 0 }
-                            $pAssists = if ($p.assists) { [int]$p.assists } else { 0 }
-                            $pRating = if ($p.game_rating) { [double]$p.game_rating } else { 6.5 }
-                            $pPasses = if ($p.passes) { [int]$p.passes } else { 0 }
-                            $pPassAcc = if ($p.pass_accuracy_pct_derived) { [int][double]$p.pass_accuracy_pct_derived } else { 0 }
-                            $pShots = if ($p.shots) { [int]$p.shots } else { $pGoals }
-                            $pShotAcc = if ($pShots -gt 0 -and $p.shots_on_target) { [int](([int]$p.shots_on_target / $pShots) * 100) } else { 0 }
-                            $pTackles = if ($p.tackles) { [int]$p.tackles } else { 0 }
-                            $pTacklesComp = if ($p.stand_tackles_won) { [int]$p.stand_tackles_won } elseif ($p.tackles_completed) { [int]$p.tackles_completed } else { $pTackles }
-                            $pTacklePct = if ($p.stand_tackles -and [int]$p.stand_tackles -gt 0) { [int][double]$p.stand_tackle_success_pct_derived } elseif ($pTackles -gt 0) { [int](($pTacklesComp / $pTackles) * 100) } else { 80 }
-                            $pInterceptions = if ($p.interceptions) { [int]$p.interceptions } else { 0 }
-                            $pCleanSheet = ($opponentScore -eq 0)
-                            $isMotm = ($p.player_name -eq $topPlayer -or $p.man_of_the_match -eq "true" -or $p.man_of_the_match -eq 1)
-
-                            $playerPerfs += [PSCustomObject]@{
-                                playerId = $pId
-                                playerName = $pName
-                                rating = $pRating
-                                goals = $pGoals
-                                assists = $pAssists
-                                passes = $pPasses
-                                passAccuracy = $pPassAcc
-                                shots = $pShots
-                                shotAccuracy = $pShotAcc
-                                tackles = $pTackles
-                                tacklePercentage = $pTacklePct
-                                interceptions = $pInterceptions
-                                cleanSheet = $pCleanSheet
-                                yellowCard = ($p.yellow_card_events -and [int]$p.yellow_card_events -gt 0)
-                                redCard = ($p.red_dismissals -and [int]$p.red_dismissals -gt 0)
-                                isMotm = $isMotm
-                            }
-
-                            if ($pGoals -gt 0) {
-                                for ($g = 1; $g -le $pGoals; $g++) {
-                                    $goalDetails += [PSCustomObject]@{
-                                        playerName = $pName
-                                        minute = 15 + ($g * 22)
-                                        isOpponent = $false
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    # Add opponent goals
-                    if ($opponentScore -gt 0) {
-                        for ($og = 1; $og -le $opponentScore; $og++) {
-                            $goalDetails += [PSCustomObject]@{
-                                playerName = "$oppName Goal"
-                                minute = 18 + ($og * 20)
-                                isOpponent = $true
-                            }
-                        }
-                    }
-
-                    $etStr = if ($homePen -gt 0 -or $awayPen -gt 0) { " (Pens: $homePen-$awayPen)" } elseif ($isExtraTime) { " (A.E.T.)" } else { "" }
-                    $msg = "Full Time: $managedClubName $(if ($isHome) { 'vs' } else { '@' }) $managedScore - $opponentScore $oppName ($compName - $stageVal)$etStr"
-                    $matchPayload = [PSCustomObject]@{
-                        dataType = "match"
-                        title = "Live Match Final"
-                        message = $msg
-                        opponentName = $oppName
-                        isHome = $isHome
-                        goalsFor = $managedScore
-                        goalsAgainst = $opponentScore
-                        resultBadge = $resultBadge
-                        date = $matchDate
-                        competition = $compName
-                        stage = $stageVal
-                        isExtraTime = $isExtraTime
-                        homePenalties = $homePen
-                        awayPenalties = $awayPen
-                        shotsFor = $shotsFor
-                        shotsAgainst = $shotsAgainst
-                        possession = $possession
-                        passingAccuracy = $passAcc
-                        expectedGoals = [Math]::Round($xGF, 2)
-                        expectedGoalsAgainst = [Math]::Round($xGA, 2)
-                        motmName = $topPlayer
-                        leaguePosition = $(if ($currentTablePos -gt 0) { $currentTablePos } else { $null })
-                        playerPerformances = $playerPerfs
-                        goalDetails = $goalDetails
-                    }
-
-                    $jsonPayload = $matchPayload | ConvertTo-Json -Depth 6 -Compress
-                    Add-TelemetryEvent -Title "Live Match Final" -Message $msg -RawPayload $jsonPayload
-
-                    Write-Host "  -> ⚽ Imported Match: $msg" -ForegroundColor Green
-                    Write-Host "     xG: $([Math]::Round($xGF, 2)) - $([Math]::Round($xGA, 2)) | MOTM: $topPlayer | Squad: $($playerPerfs.Count) players" -ForegroundColor Yellow
-
-                    $global:ProcessedAtlasFolders.Add($folderId) | Out-Null
                 }
             }
         }
-    } catch {}
+        $global:AtlasFirstScan = $false
+    } catch {
+        # Report each distinct error once instead of every 2 seconds (it used to be swallowed completely)
+        $errText = "$($_.Exception.Message)"
+        if ($errText -ne $global:LastAtlasError) {
+            $global:LastAtlasError = $errText
+            Write-Host "[PROJECT ATLAS] watcher error: $errText" -ForegroundColor Yellow
+            Write-Host "   $($_.ScriptStackTrace)" -ForegroundColor DarkGray
+        }
+    }
 }
+
+Import-AtlasState
 
 $asyncResult = $Listener.BeginGetContext($null, $null)
 $lastAtlasCheck = [DateTime]::MinValue
@@ -773,7 +1049,7 @@ while ($Listener.IsListening) {
 
         if ($rawPath -eq "/clear" -or ($rawPath -eq "/events" -and $Request.HttpMethod -eq "DELETE")) {
             $global:EventList.Clear()
-            try { "[]" | Set-Content $EventsFile -Encoding UTF8 } catch {}
+            Save-TelemetryEvents
             Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Cleared all telemetry events." -ForegroundColor Magenta
             if ($Request.HttpMethod -eq "GET") {
                 $Response.Redirect("/")
@@ -790,36 +1066,60 @@ while ($Listener.IsListening) {
         }
 
         if ($Request.HttpMethod -eq "POST") {
-            $encoding = [System.Text.Encoding]::UTF8
-            if ($Request.ContentEncoding) {
-                $encoding = $Request.ContentEncoding
+            $Body = Read-RequestBody $Request
+            if ($null -eq $Body) {
+                Send-Reject $Response 413 "Payload too large."
+                continue
             }
-            $Reader = New-Object System.IO.StreamReader($Request.InputStream, $encoding)
-            $Body = $Reader.ReadToEnd()
-            $Reader.Dispose()
+            $text = $Body.Trim()
+            if ($text -eq "") {
+                Send-Reject $Response 400 "Empty body."
+                continue
+            }
 
-            if (-not [string]::IsNullOrWhiteSpace($Body)) {
-                $jsonObj = $null
-                try {
-                    $jsonObj = $Body | ConvertFrom-Json
-                } catch {}
+            $reply = '{"status":"ok"}'
+            if ($text.StartsWith("{") -or $text.StartsWith("[")) {
+                # JSON from the Live Editor scripts. A malformed one is refused with HTTP 400 instead of being stored:
+                # a broken event that looks like JSON would stall the phone app for every event after it.
+                $jsonObj = ConvertFrom-JsonObject $text
+                if ($null -eq $jsonObj) {
+                    $preview = if ($text.Length -gt 120) { $text.Substring(0, 120) } else { $text }
+                    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] REJECTED malformed JSON payload ($($text.Length) bytes): $preview" -ForegroundColor Red
+                    Send-Reject $Response 400 "Payload is not a valid JSON object."
+                    continue
+                }
+
+                # Store compact, strictly valid JSON (raw control characters inside strings are escaped)
+                if ([regex]::IsMatch($text, '[\x00-\x1F]')) {
+                    $compact = ConvertTo-CompactJson $text
+                    if ($null -ne (ConvertFrom-JsonObject $compact)) { $text = $compact }
+                }
 
                 $title = "Match Update"
-                $msg = $Body
-                if ($jsonObj -and $jsonObj.title) { $title = $jsonObj.title }
-                if ($jsonObj -and $jsonObj.message) { $msg = $jsonObj.message }
+                if ($jsonObj.title) { $title = [string]$jsonObj.title }
+                $msg = ""
+                if ($jsonObj.message) { $msg = Remove-PenaltyNoise ([string]$jsonObj.message) }
 
-                Add-TelemetryEvent -Title $title -Message $msg -RawPayload $Body
-                if ($jsonObj -and $jsonObj.opponentName) {
-                    Write-Host "  -> Result: $($jsonObj.goalsFor) - $($jsonObj.goalsAgainst) vs $($jsonObj.opponentName)" -ForegroundColor Yellow
-                } elseif ($jsonObj -and $jsonObj.playerName) {
-                    Write-Host "  -> Transfer: $($jsonObj.playerName) ($($jsonObj.type))" -ForegroundColor Cyan
+                if ($jsonObj.dataType -eq "match") {
+                    $added = Add-MatchEvent -Title $title -Message $msg -RawPayload $text -Opponent ([string]$jsonObj.opponentName) -GoalsFor (ConvertTo-Int $jsonObj.goalsFor) -GoalsAgainst (ConvertTo-Int $jsonObj.goalsAgainst) -FixtureKey ([string]$jsonObj.fixtureKey)
+                    if ($added) {
+                        Write-Host "  -> Result: $($jsonObj.goalsFor) - $($jsonObj.goalsAgainst) vs $($jsonObj.opponentName)" -ForegroundColor Yellow
+                    } else {
+                        $reply = '{"status":"duplicate"}'
+                    }
+                } else {
+                    Add-TelemetryEvent -Title $title -Message $msg -RawPayload $text
+                    if ($jsonObj.playerName) {
+                        Write-Host "  -> Transfer: $($jsonObj.playerName) ($($jsonObj.type))" -ForegroundColor Cyan
+                    }
                 }
+            } else {
+                Add-TelemetryEvent -Title "Match Update" -Message (Remove-PenaltyNoise $text)
             }
 
             $Response.StatusCode = 200
             $Response.ContentType = "application/json"
-            $buffer = [System.Text.Encoding]::UTF8.GetBytes('{"status":"ok"}')
+            $buffer = [System.Text.Encoding]::UTF8.GetBytes($reply)
             $Response.ContentLength64 = $buffer.Length
             $Response.OutputStream.Write($buffer, 0, $buffer.Length)
             $Response.Close()

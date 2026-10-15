@@ -3,19 +3,46 @@
 -- Beams your latest match immediately to your phone and the Live Bridge
 -- =========================================================================
 
+local user_profile = os.getenv("USERPROFILE") or ""
+local COMMUNITY_ROOT = (user_profile ~= "" and user_profile or ".") .. "/Documents/FC26 Export"
+local OUTBOX_DIR = COMMUNITY_ROOT .. "/outbox"
+
+local function win_path(p)
+    local converted = tostring(p or ""):gsub("/", string.char(92))
+    return converted
+end
+
+local function trim(value)
+    local text = tostring(value or "")
+    text = text:gsub("^%s+", "")
+    text = text:gsub("%s+$", "")
+    return text
+end
+
+local function file_exists(path)
+    local f = io.open(path, "rb")
+    if f then f:close() return true end
+    return false
+end
+
+pcall(function()
+    os.execute('if not exist "' .. win_path(COMMUNITY_ROOT) .. '" mkdir "' .. win_path(COMMUNITY_ROOT) .. '"')
+    os.execute('if not exist "' .. win_path(OUTBOX_DIR) .. '" mkdir "' .. win_path(OUTBOX_DIR) .. '"')
+end)
+
 local function my_log(msg)
     local s = "[SendLatestMatch] " .. tostring(msg)
     pcall(print, s)
     pcall(function()
-        local userProfile = os.getenv("USERPROFILE")
-        local logPath = (userProfile and userProfile ~= "") and (userProfile .. "\\Desktop\\telemetry_sync_log.txt") or "telemetry_sync_log.txt"
-        local f = io.open(logPath, "a")
+        local f = io.open(COMMUNITY_ROOT .. "/telemetry_sync_log.txt", "a")
         if f then
             f:write(os.date("%Y-%m-%d %H:%M:%S") .. " " .. s .. "\n")
             f:close()
         end
     end)
 end
+
+local function log_monitor(msg) my_log(msg) end
 
 local function safe_get_rows(tbl_name)
     local ok, res = pcall(GetDBTableRows, tbl_name)
@@ -61,32 +88,260 @@ local function escape_str(s)
     return str:gsub("^%s*(.-)%s*$", "%1")
 end
 
-local function send_to_bridge(json_payload)
+-- ---------------------------------------------------------------------------
+-- Minimal JSON syntax check. Every payload is validated before it leaves the
+-- game, so one odd player name can never put a broken event on the bridge.
+-- ---------------------------------------------------------------------------
+local function json_check(text)
+    local pos = 1
+    local len = #text
+    local fail_msg = nil
+
+    local function fail(msg)
+        if not fail_msg then fail_msg = msg .. " at char " .. tostring(pos) end
+        return false
+    end
+    local function skip_ws()
+        pos = text:find("[^ \t\r\n]", pos) or (len + 1)
+    end
+
+    local parse_value
+
+    local function parse_string()
+        pos = pos + 1 -- opening quote
+        while pos <= len do
+            local c = text:sub(pos, pos)
+            if c == '"' then
+                pos = pos + 1
+                return true
+            elseif c == "\\" then
+                local e = text:sub(pos + 1, pos + 1)
+                if e == "u" then
+                    if not text:sub(pos + 2, pos + 5):match("^%x%x%x%x$") then return fail("bad \\u escape") end
+                    pos = pos + 6
+                elseif e:match('^["\\/bfnrt]$') then
+                    pos = pos + 2
+                else
+                    return fail("bad escape")
+                end
+            elseif c:byte() < 32 then
+                return fail("control character in string")
+            else
+                pos = pos + 1
+            end
+        end
+        return fail("unterminated string")
+    end
+
+    local function parse_number()
+        local s = text:match("^-?%d+%.?%d*[eE]?[+-]?%d*", pos)
+        if not s or s == "" or s == "-" then return fail("bad number") end
+        if not tonumber(s) then return fail("bad number") end
+        pos = pos + #s
+        return true
+    end
+
+    local function parse_array()
+        pos = pos + 1
+        skip_ws()
+        if text:sub(pos, pos) == "]" then pos = pos + 1 return true end
+        while true do
+            skip_ws()
+            if not parse_value() then return false end
+            skip_ws()
+            local c = text:sub(pos, pos)
+            if c == "," then pos = pos + 1
+            elseif c == "]" then pos = pos + 1 return true
+            else return fail("expected , or ]") end
+        end
+    end
+
+    local function parse_object()
+        pos = pos + 1
+        skip_ws()
+        if text:sub(pos, pos) == "}" then pos = pos + 1 return true end
+        while true do
+            skip_ws()
+            if text:sub(pos, pos) ~= '"' then return fail("expected key") end
+            if not parse_string() then return false end
+            skip_ws()
+            if text:sub(pos, pos) ~= ":" then return fail("expected :") end
+            pos = pos + 1
+            skip_ws()
+            if not parse_value() then return false end
+            skip_ws()
+            local c = text:sub(pos, pos)
+            if c == "," then pos = pos + 1
+            elseif c == "}" then pos = pos + 1 return true
+            else return fail("expected , or }") end
+        end
+    end
+
+    parse_value = function()
+        skip_ws()
+        local c = text:sub(pos, pos)
+        if c == "{" then return parse_object()
+        elseif c == "[" then return parse_array()
+        elseif c == '"' then return parse_string()
+        elseif text:sub(pos, pos + 3) == "true" then pos = pos + 4 return true
+        elseif text:sub(pos, pos + 4) == "false" then pos = pos + 5 return true
+        elseif text:sub(pos, pos + 3) == "null" then pos = pos + 4 return true
+        elseif c == "-" or c:match("%d") then return parse_number()
+        end
+        return fail("unexpected character")
+    end
+
+    if type(text) ~= "string" or text == "" then return false, "empty payload" end
+    local ok = parse_value()
+    if ok then
+        skip_ws()
+        if pos <= len then return false, "trailing characters at char " .. tostring(pos) end
+        return true
+    end
+    return false, fail_msg or "invalid JSON"
+end
+
+-- ---------------------------------------------------------------------------
+-- Reliable delivery to the bridge ("outbox").
+-- Each payload is written to Documents\FC26 Export\outbox and a small .bat posts
+-- it to the bridge on this PC. The .bat only deletes the file after the bridge
+-- answers HTTP 200, and writes the HTTP code to bridge_send_log.txt. Anything
+-- still in the outbox (bridge was closed, firewall hiccup...) is retried every
+-- 30 s and picked up again the next time the script starts.
+-- ---------------------------------------------------------------------------
+local SEND_LOG = COMMUNITY_ROOT .. "/bridge_send_log.txt"
+local OUTBOX_RETRY_SECONDS = 30
+local OUTBOX_MAX_ATTEMPTS = 40
+local OUTBOX_MAX_AGE_SECONDS = 7 * 24 * 3600
+
+local SENDER_BAT = [[
+@echo off
+set "J=@@JSON@@"
+set "L=@@LOG@@"
+set "ID=@@ID@@"
+set "CODE=000"
+call :try http://127.0.0.1:5050
+if not "%CODE%"=="200" ping -n 2 127.0.0.1 >nul
+if not "%CODE%"=="200" call :try http://127.0.0.1:5050
+if not "%CODE%"=="200" call :try http://127.0.0.1:8080
+if not "%CODE%"=="200" call :psfallback
+>>"%L%" echo %date% %time% [%ID%] HTTP %CODE%
+if "%CODE%"=="200" del "%J%" >nul 2>&1
+(goto) 2>nul & del "%~f0" >nul 2>&1 & exit
+:try
+for /f "usebackq delims=" %%C in (`curl.exe -s -o NUL -w "%%{http_code}" -m 6 -X POST -H "Content-Type: application/json; charset=utf-8" --data-binary @"%J%" %1 2^>NUL`) do set "CODE=%%C"
+exit /b
+:psfallback
+for /f "usebackq delims=" %%C in (`powershell -NoProfile -Command "try { (Invoke-WebRequest -UseBasicParsing -Uri http://127.0.0.1:5050 -Method Post -ContentType 'application/json; charset=utf-8' -InFile '%J%' -TimeoutSec 6).StatusCode } catch { 0 }" 2^>NUL`) do set "CODE=%%C"
+exit /b
+]]
+
+local outbox_pending = {} -- json path -> { id = , tries = , last_try = }
+
+local function launch_outbox_sender(json_path, id)
     local temp_dir = os.getenv("TEMP") or os.getenv("TMP") or "."
-    local ts = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999))
-    local temp_json = temp_dir .. "\\fifa_telemetry_payload_" .. ts .. ".json"
-    local temp_bat = temp_dir .. "\\fifa_send_telemetry_" .. ts .. ".bat"
-    
-    local jf = io.open(temp_json, "wb")
-    if jf then
-        jf:write(json_payload)
+    local bat_path = temp_dir .. "/fc26_send_" .. id .. ".bat"
+    local body = SENDER_BAT
+    body = body:gsub("@@JSON@@", function() return win_path(json_path) end)
+    body = body:gsub("@@LOG@@", function() return win_path(SEND_LOG) end)
+    body = body:gsub("@@ID@@", function() return id end)
+    local bf = io.open(bat_path, "w")
+    if not bf then return false end
+    bf:write(body)
+    bf:close()
+    os.execute('start /min "" cmd /c "' .. win_path(bat_path) .. '"')
+    return true
+end
+
+local function track_outbox_file(json_path, id)
+    outbox_pending[json_path] = outbox_pending[json_path] or { id = id, tries = 0, last_try = 0 }
+    local entry = outbox_pending[json_path]
+    entry.tries = entry.tries + 1
+    entry.last_try = os.time()
+    return launch_outbox_sender(json_path, id)
+end
+
+local function send_payload_to_bridge(payload, log_label)
+    local ok, err = xpcall(function()
+        local valid, why = json_check(payload)
+        if not valid then
+            log_monitor("PAYLOAD REJECTED (" .. tostring(why) .. ") for " .. tostring(log_label) .. " - not sent")
+            local bad = io.open(COMMUNITY_ROOT .. "/last_bad_payload.json", "wb")
+            if bad then bad:write(payload) bad:close() end
+            return
+        end
+
+        local id = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999))
+        local json_path = OUTBOX_DIR .. "/" .. id .. ".json"
+        local jf = io.open(json_path, "wb")
+        if not jf then
+            log_monitor("Cannot write " .. json_path .. " - payload not sent")
+            return
+        end
+        jf:write(payload)
         jf:close()
+
+        if track_outbox_file(json_path, id) then
+            log_monitor("Queued for bridge [" .. id .. "]: " .. tostring(log_label) .. "  (result is written to bridge_send_log.txt)")
+        else
+            log_monitor("Could not start the sender for [" .. id .. "] - will retry")
+        end
+    end, debug.traceback)
+    if not ok then
+        log_monitor("Error in send_payload_to_bridge: " .. tostring(err))
     end
-    
-    local bf = io.open(temp_bat, "w")
-    if bf then
-        bf:write(string.format([[@echo off
-curl -s -X POST -H "Content-Type: application/json; charset=utf-8" --data-binary @"%s" http://127.0.0.1:5050 >nul 2>&1
-if %%ERRORLEVEL%% NEQ 0 (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Invoke-RestMethod -Uri 'http://127.0.0.1:5050' -Method POST -ContentType 'application/json; charset=utf-8' -InFile '%s' } catch {}" >nul 2>&1
-)
-del "%s" >nul 2>&1
-(goto) 2>nul & del "%%~f0" >nul 2>&1 & exit
-]], temp_json, temp_json, temp_json))
-        bf:close()
-        os.execute(string.format('start /min "" cmd /c "%s"', temp_bat))
-        my_log("Dispatched match payload to bridge (" .. tostring(#json_payload) .. " bytes)")
+end
+
+-- Re-send anything the bridge has not acknowledged yet. Cheap: no process is started unless something is waiting.
+local function service_outbox()
+    local now = os.time()
+    for json_path, entry in pairs(outbox_pending) do
+        if not file_exists(json_path) then
+            outbox_pending[json_path] = nil -- delivered (the .bat deleted it)
+        elseif entry.tries >= OUTBOX_MAX_ATTEMPTS then
+            -- leave the file in the outbox; it is adopted again on the next script start
+            outbox_pending[json_path] = nil
+        elseif now - entry.last_try >= OUTBOX_RETRY_SECONDS then
+            entry.tries = entry.tries + 1
+            entry.last_try = now
+            launch_outbox_sender(json_path, entry.id)
+            log_monitor("Retrying undelivered payload [" .. entry.id .. "] (attempt " .. entry.tries .. ")")
+        end
     end
+end
+
+-- On startup: pick up payloads that were never delivered last time (bridge was not running).
+local function adopt_outbox_leftovers()
+    local temp_dir = os.getenv("TEMP") or os.getenv("TMP") or "."
+    local list_file = temp_dir .. "/fc26_outbox_" .. tostring(os.time()) .. ".txt"
+    pcall(os.execute, string.format('cmd /c dir /b "%s" > "%s" 2>nul', win_path(OUTBOX_DIR .. "/*.json"), win_path(list_file)))
+    local lf = io.open(list_file, "r")
+    if not lf then return 0 end
+    local adopted = 0
+    local now = os.time()
+    for line in lf:lines() do
+        local name = trim(line)
+        local ts = tonumber(name:match("^(%d+)_%d+%.json$"))
+        if ts then
+            local path = OUTBOX_DIR .. "/" .. name
+            if now - ts > OUTBOX_MAX_AGE_SECONDS then
+                pcall(os.remove, path)
+            elseif not outbox_pending[path] then
+                outbox_pending[path] = { id = name:gsub("%.json$", ""), tries = 0, last_try = 0 }
+                adopted = adopted + 1
+            end
+        end
+    end
+    lf:close()
+    pcall(os.remove, list_file)
+    if adopted > 0 then
+        log_monitor("Found " .. adopted .. " undelivered payload(s) from an earlier session - sending now")
+    end
+    return adopted
+end
+
+local function send_to_bridge(json_payload, label)
+    send_payload_to_bridge(json_payload, label or "Match")
 end
 
 local function execute_send()
@@ -299,7 +554,7 @@ local function execute_send()
         title, msg, oppName, isHome and "true" or "false", gf, ga, badge, todayDateStr, competitionName, stageName, poss, shotsF, shotsA, xGF, xGA, topPlayerName, matchPerfsStr, matchGoalsStr
     )
 
-    send_to_bridge(payload)
+    send_to_bridge(payload, "Match: " .. msg)
     my_log(">>> MATCH SUCCESSFULLY BEAMED TO BRIDGE! <<<")
     my_log(msg)
     print("=========================================================================")
@@ -308,8 +563,20 @@ local function execute_send()
     print("=========================================================================")
 end
 
-local ok, err = pcall(execute_send)
-if not ok then
-    my_log("ERROR: " .. tostring(err))
-    print("[SendLatestMatch ERROR] " .. tostring(err))
+-- When FC26_Auto_Capture.lua is running it has the real fixture, lineup and Atlas stats: use that.
+local ac = _G["FC26_AUTO_CAPTURE_STATE"]
+if ac and ac.active and type(FC26_AutoCapture_SyncLatest) == "function" then
+    my_log("FC26_Auto_Capture.lua is running - sending your latest match with real data instead.")
+    local okAc, errAc = pcall(FC26_AutoCapture_SyncLatest)
+    if not okAc then
+        my_log("Auto Capture sync failed (" .. tostring(errAc) .. ") - falling back to the estimated match")
+        pcall(execute_send)
+    end
+else
+    pcall(adopt_outbox_leftovers)
+    local ok, err = pcall(execute_send)
+    if not ok then
+        my_log("ERROR: " .. tostring(err))
+        print("[SendLatestMatch ERROR] " .. tostring(err))
+    end
 end

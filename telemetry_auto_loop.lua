@@ -13,17 +13,17 @@ my_log("==========================================================")
 my_log("EA FC LIVE TELEMETRY: OPTION B (FULLY AUTOMATIC)")
 my_log("==========================================================")
 
--- Helper function to find telemetry_sync.lua across all folders
-local function get_sync_script_path()
+-- Helper: find one of our scripts across the usual folders
+local function get_script_path(fileName)
     local userProfile = os.getenv("USERPROFILE") or ""
     local candidatePaths = {
-        userProfile .. "\\Desktop\\FC26-LE\\FC 26 LE v26.3.6\\lua\\scripts\\telemetry_sync.lua",
-        userProfile .. "\\Desktop\\FC26-LE\\telemetry_sync.lua",
-        "telemetry_sync.lua",
-        "FC 26 LE v26.3.6\\lua\\scripts\\telemetry_sync.lua",
-        "lua\\scripts\\telemetry_sync.lua",
-        userProfile .. "\\Desktop\\telemetry_sync.lua",
-        userProfile .. "\\Downloads\\telemetry_sync.lua"
+        userProfile .. "\\Desktop\\FC26-LE\\FC 26 LE v26.3.6\\lua\\scripts\\" .. fileName,
+        userProfile .. "\\Desktop\\FC26-LE\\" .. fileName,
+        fileName,
+        "FC 26 LE v26.3.6\\lua\\scripts\\" .. fileName,
+        "lua\\scripts\\" .. fileName,
+        userProfile .. "\\Desktop\\" .. fileName,
+        userProfile .. "\\Downloads\\" .. fileName
     }
     for _, p in ipairs(candidatePaths) do
         local f = io.open(p, "r")
@@ -32,13 +32,24 @@ local function get_sync_script_path()
             return p
         end
     end
-    return "telemetry_sync.lua"
+    return nil
 end
 
-local syncPath = get_sync_script_path()
-my_log("Loading telemetry script: " .. syncPath)
+-- FC26_Auto_Capture.lua reads the real fixtures, lineups and stats: start it first.
+-- telemetry_sync.lua (database-delta fallback) is only used when Auto Capture cannot start.
+local ok, err = false, "FC26_Auto_Capture.lua not found"
+local autoPath = get_script_path("FC26_Auto_Capture.lua")
+if autoPath then
+    my_log("Loading real-data capture: " .. autoPath)
+    ok, err = pcall(dofile, autoPath)
+    if not ok then my_log("FC26_Auto_Capture.lua could not start: " .. tostring(err)) end
+end
+if not ok then
+    local syncPath = get_script_path("telemetry_sync.lua") or "telemetry_sync.lua"
+    my_log("Falling back to telemetry script: " .. syncPath)
+    ok, err = pcall(dofile, syncPath)
+end
 
-local ok, err = pcall(dofile, syncPath)
 if not ok then
     my_log("Error starting automatic telemetry sync: " .. tostring(err))
     print("[TelemetryAutoLoop ERROR] " .. tostring(err))

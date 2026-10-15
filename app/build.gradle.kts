@@ -39,14 +39,31 @@ android {
     }
   }
 
+  // The project's own debug.keystore is not committed to the repository. When it is missing (a fresh checkout,
+  // GitHub Actions) fall back to Android's standard auto-generated debug key so the build does not fail.
+  val projectDebugKeyExists = file("${rootDir}/debug.keystore").exists()
+  val debugSigning = if (projectDebugKeyExists) signingConfigs.getByName("debugConfig") else signingConfigs.getByName("debug")
+
   buildTypes {
     release {
       isCrunchPngs = false
       isMinifyEnabled = false
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      signingConfig = signingConfigs.getByName("debugConfig")
+      signingConfig = debugSigning
     }
-    debug { signingConfig = signingConfigs.getByName("debugConfig") }
+    debug { signingConfig = debugSigning }
+    // Test build that installs NEXT TO the normal app instead of replacing it:
+    //   package name  com.aistudio.fccareer.zqxwv.test   (own data, own settings)
+    //   app name      "FC Tracker (Test)"                (see src/fctest/res/values/strings.xml)
+    // Build it with:  gradlew :app:assembleFctest   ->   app/build/outputs/apk/fctest/app-fctest.apk
+    create("fctest") {
+      initWith(getByName("debug"))
+      applicationIdSuffix = ".test"
+      versionNameSuffix = "-test"
+      isDebuggable = false
+      signingConfig = debugSigning
+      matchingFallbacks += listOf("debug")
+    }
   }
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_11

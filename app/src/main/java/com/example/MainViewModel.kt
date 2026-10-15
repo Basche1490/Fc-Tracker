@@ -584,7 +584,8 @@ class MainViewModel(application: android.app.Application) : androidx.lifecycle.A
                 if (response.startsWith("[")) {
                     val jsonArray = org.json.JSONArray(response)
                     for (i in 0 until jsonArray.length()) {
-                        eventObjects.add(jsonArray.getJSONObject(i))
+                        // One malformed entry must not throw away every other event in the list
+                        jsonArray.optJSONObject(i)?.let { eventObjects.add(it) }
                     }
                 } else {
                     for (line in response.lines()) {
@@ -637,7 +638,9 @@ class MainViewModel(application: android.app.Application) : androidx.lifecycle.A
             val trimmedMessage = rawMessage.trim()
             
             if (trimmedMessage.startsWith("{") && trimmedMessage.endsWith("}")) {
-                val dataObj = org.json.JSONObject(trimmedMessage)
+                // A malformed event is skipped; it used to throw and stop every event after it
+                val dataObj = try { org.json.JSONObject(trimmedMessage) } catch (e: Exception) { null }
+                if (dataObj == null) continue
                 val dataType = dataObj.optString("dataType")
                 val evTitle = dataObj.optString("title", rawTitle)
                 val rawEvMsg = dataObj.optString("message", "")
@@ -767,7 +770,15 @@ class MainViewModel(application: android.app.Application) : androidx.lifecycle.A
                     val cleanEtStr = if (hp > 0 || ap > 0) " (Pens: $hp-$ap)" else if (isET) " (A.E.T.)" else ""
                     val cleanedEvMsg = sanitizeEventMessage("Full Time: ${_state.value.clubName} ${if (isHome) "vs" else "@"} $gf - $ga $oppName ($comp - $stageVal)$cleanEtStr")
 
-                    if (!events.any { it.title == evTitle && it.timestamp == timestamp }) {
+                    // The same match can arrive from two sources (database + Atlas export): ignore the second one
+                    val isDuplicateMatch = newMatches.any { m ->
+                        m.opponentName.filter { ch -> ch.isLetterOrDigit() }.equals(oppName.filter { ch -> ch.isLetterOrDigit() }, ignoreCase = true) &&
+                        m.goalsFor == gf && m.goalsAgainst == ga && m.matchDate == mDate && m.isHome == isHome
+                    }
+                    var isNewMatchEvent = false
+
+                    if (!isDuplicateMatch && !events.any { it.title == evTitle && it.timestamp == timestamp }) {
+                        isNewMatchEvent = true
                         events.add(LiveEvent(evTitle, cleanedEvMsg, timestamp))
                         hasNew = true
 
@@ -779,7 +790,8 @@ class MainViewModel(application: android.app.Application) : androidx.lifecycle.A
                             !it.isAcademy && !it.isLoanedOut && !it.status.equals("Sold", true) && !existingIds.contains(it.id) && !existingIds.contains(it.displayName)
                         }.sortedByDescending { it.overall }
 
-                        val neededStarters = (11 - perfList.size).coerceAtLeast(0)
+                        // Real exported line-ups (detailSource = atlas) are complete: never invent players for them
+                        val neededStarters = if (dataObj.optString("detailSource") == "atlas") 0 else (11 - perfList.size).coerceAtLeast(0)
                         for (i in 0 until neededStarters.coerceAtMost(availableSeniorSquad.size)) {
                             val p = availableSeniorSquad[i]
                             val pos = p.primaryPosition.uppercase()
@@ -927,7 +939,9 @@ class MainViewModel(application: android.app.Application) : androidx.lifecycle.A
                         newInjuries += 1
                     }
                     
-                    if (notifyUser) {
+                    // Only notify for a match that was just added (this used to fire again for every stored
+                    // match on every 10-second poll)
+                    if (notifyUser && isNewMatchEvent) {
                         val route = when (dataType) {
                             "match" -> "matches"
                             "transfer" -> "transfers"

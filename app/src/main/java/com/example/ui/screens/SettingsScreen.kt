@@ -542,7 +542,7 @@ fun SettingsScreen(viewModel: MainViewModel, onMenuClick: () -> Unit) {
                         value = bridgeInput,
                         onValueChange = { bridgeInput = it },
                         label = { Text("PC Bridge Address") },
-                        placeholder = { Text("http://192.169.2.24:5050") },
+                        placeholder = { Text("http://192.168.2.24:5050") },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true
                     )

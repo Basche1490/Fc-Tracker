@@ -329,7 +329,7 @@ data class AppState(
     val viewingSeasonYear: Int? = null,
     val scoutReports: List<ScoutReport> = emptyList(),
     val liveEvents: List<LiveEvent> = emptyList(),
-    val telemetryServerUrl: String = "http://192.169.2.24:5050",
+    val telemetryServerUrl: String = "http://192.168.2.24:5050",
     val bridgeConnectionStatus: String = "Not Checked",
     val bridgeEventCount: Int = 0
 )
@@ -340,7 +340,7 @@ class MainViewModel(application: android.app.Application) : androidx.lifecycle.A
 
     private fun normalizeBridgeUrl(raw: String): String {
         var trimmed = raw.trim()
-        if (trimmed.isEmpty()) return "http://192.169.2.24:5050"
+        if (trimmed.isEmpty()) return "http://192.168.2.24:5050"
         if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
             trimmed = "http://$trimmed"
         }

@@ -156,6 +156,80 @@ function Create-SampleTransferJson {
 "@
 }
 
+# =========================================================================
+# ACCESS CONTROL
+# The phone only READS (GET /events). Everything that writes - the Lua scripts,
+# the test buttons and /clear - runs on this same PC. So reads are open to the
+# local network, but writes are only accepted from the PC itself.
+# Host / Origin checks keep web pages open in a browser from reaching the bridge.
+# =========================================================================
+$MaxBodyBytes = 5MB
+$PcName = "$env:COMPUTERNAME".ToLower()
+
+function Test-LocalClient {
+    param($Request)
+    try {
+        $remote = $Request.RemoteEndPoint.Address
+        if ($null -eq $remote) { return $false }
+        if ($remote.IsIPv4MappedToIPv6) { $remote = $remote.MapToIPv4() }
+        if ([System.Net.IPAddress]::IsLoopback($remote)) { return $true }
+        # Connecting to the PC's own LAN address: remote and local address are identical
+        $local = $Request.LocalEndPoint.Address
+        if ($null -eq $local) { return $false }
+        if ($local.IsIPv4MappedToIPv6) { $local = $local.MapToIPv4() }
+        return $remote.Equals($local)
+    } catch { return $false }
+}
+
+function Test-AllowedHost {
+    # Allow IP addresses, localhost and this PC's name. Other host names are refused
+    # so a malicious web page cannot reach the bridge through DNS rebinding.
+    param($Request)
+    $h = [string]$Request.UserHostName
+    if ([string]::IsNullOrWhiteSpace($h)) { return $true }   # HTTP/1.0 client without Host header - not a browser
+    $h = $h.Trim().ToLower()
+    if ($h.StartsWith("[")) {
+        $end = $h.IndexOf("]")
+        if ($end -gt 0) { $name = $h.Substring(1, $end - 1) } else { $name = $h }
+    } elseif (($h.Split(":").Count - 1) -eq 1) {
+        $name = $h.Split(":")[0]
+    } else {
+        $name = $h
+    }
+    if ($name -eq "localhost" -or $name -eq $PcName -or $name -eq "$PcName.local") { return $true }
+    $parsedIp = $null
+    return [System.Net.IPAddress]::TryParse($name, [ref]$parsedIp)
+}
+
+function Test-OriginAllowed {
+    # Writes may come from command-line tools (no Origin header) or from this bridge's
+    # own dashboard page. A page on any other site is refused.
+    param($Request)
+    $origin = $Request.Headers["Origin"]
+    if ([string]::IsNullOrEmpty($origin)) {
+        $site = $Request.Headers["Sec-Fetch-Site"]
+        if ([string]::IsNullOrEmpty($site)) { return $true }
+        return ($site -eq "none" -or $site -eq "same-origin")
+    }
+    try {
+        $u = [System.Uri]$origin
+        if ([string]::IsNullOrEmpty($u.Authority)) { return $false }
+        return ($u.Authority.ToLower() -eq ([string]$Request.UserHostName).ToLower())
+    } catch { return $false }
+}
+
+function Send-Reject {
+    param($Response, [int]$Code, [string]$Message)
+    try {
+        $Response.StatusCode = $Code
+        $Response.ContentType = "application/json"
+        $buf = [System.Text.Encoding]::UTF8.GetBytes((@{ status = "error"; message = $Message } | ConvertTo-Json -Compress))
+        $Response.ContentLength64 = $buf.Length
+        $Response.OutputStream.Write($buf, 0, $buf.Length)
+    } catch {}
+    try { $Response.Close() } catch {}
+}
+
 # Setup HttpListener supporting port 5050
 $Listener = New-Object System.Net.HttpListener
 $bound = $false
@@ -583,18 +657,48 @@ while ($Listener.IsListening) {
         $clientIp = if ($Request.RemoteEndPoint) { $Request.RemoteEndPoint.Address.ToString() } else { "client" }
         Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Request from $clientIp : $($Request.HttpMethod) $($Request.Url.AbsolutePath)" -ForegroundColor DarkCyan
 
-        # Add CORS Headers so web dashboard, curl, and Android app can connect freely
-        $Response.Headers.Add("Access-Control-Allow-Origin", "*")
-        $Response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
-        $Response.Headers.Add("Access-Control-Allow-Headers", "*")
+        # Security headers. No CORS headers on purpose: the phone app is not a browser and
+        # the dashboard page is served from this same origin.
+        $Response.Headers.Add("X-Content-Type-Options", "nosniff")
+        $Response.Headers.Add("X-Frame-Options", "DENY")
+        $Response.Headers.Add("Cache-Control", "no-store")
 
-        if ($Request.HttpMethod -eq "OPTIONS") {
-            $Response.StatusCode = 200
-            $Response.Close()
+        # Refuse requests addressed to unexpected host names (DNS-rebinding protection)
+        if (-not (Test-AllowedHost $Request)) {
+            Send-Reject $Response 403 "Unexpected Host header."
             continue
         }
 
+        $method = $Request.HttpMethod.ToUpper()
         $rawPath = $Request.Url.AbsolutePath.ToLower()
+        $isWriteRoute = ($rawPath -eq "/test-match") -or ($rawPath -eq "/test-transfer") -or ($rawPath -eq "/clear") -or ($rawPath -eq "/events" -and $method -eq "DELETE")
+
+        if ($method -eq "GET") {
+            # These used to fire on a plain GET, so a link or <img> tag on any web page could
+            # trigger them. They are POST/DELETE-only now (use the dashboard buttons).
+            if ($isWriteRoute) {
+                $Response.Redirect("/")
+                $Response.Close()
+                continue
+            }
+        } elseif ($method -eq "POST" -or $method -eq "DELETE") {
+            if (-not (Test-LocalClient $Request)) {
+                Send-Reject $Response 403 "Writes are only accepted from the PC running the bridge."
+                continue
+            }
+            if (-not (Test-OriginAllowed $Request)) {
+                Send-Reject $Response 403 "Cross-site request blocked."
+                continue
+            }
+            if ($Request.ContentLength64 -gt $MaxBodyBytes) {
+                Send-Reject $Response 413 "Payload too large."
+                continue
+            }
+        } else {
+            # OPTIONS (CORS preflight), HEAD, PUT and anything else is not supported
+            Send-Reject $Response 405 "Method not allowed."
+            continue
+        }
 
         if ($rawPath -eq "/test-match") {
             # Direct endpoint for generating a test match (GET or POST)
@@ -732,6 +836,7 @@ while ($Listener.IsListening) {
                 # Return Web UI Status Dashboard
                 $Response.StatusCode = 200
                 $Response.ContentType = "text/html; charset=utf-8"
+                $Response.Headers.Add("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
                 $eventCount = $global:EventList.Count
                 $html = @"
 <!DOCTYPE html>
@@ -780,9 +885,6 @@ while ($Listener.IsListening) {
         </div>
 
         <p style="font-size:11px;color:#64748b;">
-            Direct links: 
-            <a href="/test-match" style="color:#38bdf8;">[Send Match]</a> | 
-            <a href="/test-transfer" style="color:#38bdf8;">[Send Transfer]</a> | 
             <a href="/events" target="_blank" style="color:#38bdf8;">[View Raw JSON]</a>
         </p>
 
@@ -793,6 +895,13 @@ while ($Listener.IsListening) {
     </div>
 
     <script>
+        // Escape anything that came from an event before it is put into the page
+        function esc(v) {
+            return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) {
+                return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+            });
+        }
+
         function sendTestMatch() {
             const msg = document.getElementById('statusMsg');
             msg.innerHTML = '<span style="color:#38bdf8;">Sending test match...</span>';
@@ -803,8 +912,7 @@ while ($Listener.IsListening) {
                     setTimeout(updateEvents, 300);
                 })
                 .catch(err => {
-                    msg.innerHTML = '<span style="color:#ef4444;font-weight:bold;">❌ Error: ' + err + ' (Trying direct redirect...)</span>';
-                    window.location.href = '/test-match';
+                    msg.innerHTML = '<span style="color:#ef4444;font-weight:bold;">❌ Error: ' + esc(err) + '</span>';
                 });
         }
 
@@ -818,8 +926,7 @@ while ($Listener.IsListening) {
                     setTimeout(updateEvents, 300);
                 })
                 .catch(err => {
-                    msg.innerHTML = '<span style="color:#ef4444;font-weight:bold;">❌ Error: ' + err + ' (Trying direct redirect...)</span>';
-                    window.location.href = '/test-transfer';
+                    msg.innerHTML = '<span style="color:#ef4444;font-weight:bold;">❌ Error: ' + esc(err) + '</span>';
                 });
         }
 
@@ -827,7 +934,9 @@ while ($Listener.IsListening) {
             if (confirm("Clear all recorded telemetry events?")) {
                 fetch('/clear', { method: 'POST' })
                     .then(() => location.reload())
-                    .catch(() => { window.location.href = '/clear'; });
+                    .catch(err => {
+                        document.getElementById('statusMsg').innerHTML = '<span style="color:#ef4444;font-weight:bold;">❌ Error: ' + esc(err) + '</span>';
+                    });
             }
         }
 
@@ -850,13 +959,13 @@ while ($Listener.IsListening) {
                         } catch {}
                         return '<div class="event-item">' +
                             '<span class="event-time">[' + dateStr + ']</span> ' +
-                            '<strong>' + (ev.title || 'Update') + '</strong><br>' +
-                            '<span style="color:#cbd5e1;">' + summary + '</span>' +
+                            '<strong>' + esc(ev.title || 'Update') + '</strong><br>' +
+                            '<span style="color:#cbd5e1;">' + esc(summary) + '</span>' +
                         '</div>';
                     }).join('');
                 })
                 .catch(err => {
-                    document.getElementById('eventsList').innerHTML = '<div style="color:#ef4444;text-align:center;">Failed to load events: ' + err + '</div>';
+                    document.getElementById('eventsList').innerHTML = '<div style="color:#ef4444;text-align:center;">Failed to load events: ' + esc(err) + '</div>';
                 });
         }
 

@@ -28,3 +28,14 @@ How to sync matches and transfers automatically from the game to your phone in R
 
 5. Diagnostic Logs:
    - Check `telemetry_sync_log.txt` on your Desktop to see detailed status and match deltas.
+
+6. Security Notes:
+   - Your phone has read-only access. It only fetches /events from the bridge.
+   - Anything that writes (the Live Editor Lua scripts, the dashboard test buttons, Clear) must come
+     from this same PC. Writes from other devices on your network are refused (HTTP 403).
+   - The Windows firewall rule created by Start_Bridge.bat only allows devices on your local subnet.
+   - Web pages open in a browser cannot send data to the bridge (no CORS, Host and Origin checks).
+   - The /test-match, /test-transfer and /clear links no longer work by simply opening them in a browser;
+     use the buttons on the dashboard (http://localhost:5050) or Send_Test_Match.bat instead.
+   - Anyone on your local network can still READ /events if they know the address. If you play on
+     shared or public Wi-Fi, do not run the bridge there.

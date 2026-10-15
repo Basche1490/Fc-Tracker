@@ -5,9 +5,79 @@ import time
 import os
 import socket
 import re
+import html
+import ipaddress
+from urllib.parse import urlsplit
 
 LOCAL_PORT = 5050
 EVENTS_FILE = os.path.join(os.path.dirname(__file__), "telemetry_events.json")
+MAX_BODY_BYTES = 5 * 1024 * 1024  # largest POST body the bridge will accept (5 MiB)
+
+# ---------------------------------------------------------------------------
+# Access control
+#
+# The phone only ever READS (GET /events). Everything that writes - the Lua
+# scripts, the test buttons and /clear - runs on this same PC. So reads are open
+# to the local network, but writes are only accepted from the PC itself.
+# Host / Origin checks keep web pages open in a browser from reaching the bridge.
+# ---------------------------------------------------------------------------
+PC_NAME = socket.gethostname().lower()
+
+
+def _strip_mapped(addr):
+    addr = (addr or "").strip()
+    if addr.lower().startswith("::ffff:"):
+        return addr[7:]
+    return addr
+
+
+def is_local_client(client_ip, server_ip):
+    """True when the request comes from this PC (loopback, or the PC's own LAN address)."""
+    client_ip = _strip_mapped(client_ip)
+    server_ip = _strip_mapped(server_ip)
+    try:
+        if ipaddress.ip_address(client_ip).is_loopback:
+            return True
+    except ValueError:
+        return False
+    return client_ip == server_ip
+
+
+def _host_only(host_header):
+    h = (host_header or "").strip()
+    if h.startswith("["):                  # [::1]:5050
+        end = h.find("]")
+        return h[1:end] if end != -1 else h
+    if h.count(":") == 1:                  # name:port or 1.2.3.4:port
+        return h.split(":")[0]
+    return h
+
+
+def host_header_ok(host_header):
+    """Allow IP addresses, localhost and this PC's name. Other hostnames are refused
+    so a malicious web page cannot reach the bridge through DNS rebinding."""
+    host = _host_only(host_header).lower()
+    if not host:
+        return True                        # HTTP/1.0 client without a Host header - not a browser
+    if host in ("localhost", PC_NAME, PC_NAME + ".local"):
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def origin_ok(origin, host_header, sec_fetch_site=None):
+    """Writes may come from command-line tools (no Origin header) or from this
+    bridge's own dashboard page. A page on any other site is refused."""
+    if not origin:
+        return (sec_fetch_site or "none").lower() in ("none", "same-origin")
+    try:
+        netloc = urlsplit(origin).netloc.lower()
+    except ValueError:
+        return False
+    return bool(netloc) and netloc == (host_header or "").strip().lower()
 
 def sanitize_penalty_text(text):
     if not text:
@@ -98,17 +168,50 @@ def create_sample_match():
     }
 
 class TelemetryHandler(http.server.BaseHTTPRequestHandler):
+    timeout = 15  # drop clients that stall in the middle of a request
+
     def end_headers(self):
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE')
-        self.send_header('Access-Control-Allow-Headers', '*')
+        # Deliberately no CORS headers: the phone app is not a browser and the
+        # dashboard page is served from this same origin.
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Cache-Control', 'no-store')
         super().end_headers()
 
-    def do_OPTIONS(self):
-        self.send_response(200)
+    def _reject(self, code, message):
+        body = json.dumps({"status": "error", "message": message}).encode()
+        self.send_response(code)
+        self.send_header('Content-type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
         self.end_headers()
+        self.wfile.write(body)
+
+    def _host_allowed(self):
+        if host_header_ok(self.headers.get('Host')):
+            return True
+        self._reject(403, "Unexpected Host header.")
+        return False
+
+    def _write_allowed(self):
+        """Gate for anything that changes state. Sends the error reply itself when refusing."""
+        if not self._host_allowed():
+            return False
+        server_ip = self.connection.getsockname()[0]
+        if not is_local_client(self.client_address[0], server_ip):
+            self._reject(403, "Writes are only accepted from the PC running the bridge.")
+            return False
+        if not origin_ok(self.headers.get('Origin'), self.headers.get('Host'), self.headers.get('Sec-Fetch-Site')):
+            self._reject(403, "Cross-site request blocked.")
+            return False
+        return True
+
+    def do_OPTIONS(self):
+        # No CORS preflight support - browsers on other sites must not be able to write.
+        self._reject(405, "Method not allowed.")
 
     def do_POST(self):
+        if not self._write_allowed():
+            return
         path = self.path.lower()
         if path == "/test-match":
             sample = create_sample_match()
@@ -146,7 +249,17 @@ class TelemetryHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b'{"status":"cleared"}')
             return
 
-        content_length = int(self.headers.get('Content-Length', 0))
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+        except ValueError:
+            self._reject(400, "Bad Content-Length.")
+            return
+        if content_length < 0:
+            self._reject(400, "Bad Content-Length.")
+            return
+        if content_length > MAX_BODY_BYTES:
+            self._reject(413, "Payload too large.")
+            return
         post_data = self.rfile.read(content_length).decode('utf-8', errors='ignore')
         
         try:
@@ -165,32 +278,15 @@ class TelemetryHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b'{"status":"ok"}')
 
     def do_GET(self):
-        path = self.path.lower()
-        if path == "/test-match":
-            sample = create_sample_match()
-            add_event("Live Match Final", "Full Time: vs 3 - 1 Arsenal (Premier League)", json.dumps(sample))
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(b'<!DOCTYPE html><html><head><meta http-equiv="refresh" content="2;url=/" /></head><body style="background:#0f172a;color:#10b981;font-family:sans-serif;padding:40px;text-align:center;"><h2>\xe2\x9c\x85 Test Match Sent! (3 - 1 vs Arsenal)</h2><p style="color:#f8fafc;">Check your phone app. Redirecting to dashboard...</p></body></html>')
+        if not self._host_allowed():
             return
-
-        if path == "/test-transfer":
-            sample = {
-                "dataType": "transfer",
-                "title": "Transfer Finalized",
-                "message": "Erling Haaland signed from Manchester City for €120.0M",
-                "playerName": "Erling Haaland",
-                "type": "Bought",
-                "feeM": 120.0,
-                "fromToClub": "Manchester City",
-                "date": time.strftime("%Y-%m-%d")
-            }
-            add_event("Transfer Finalized", sample["message"], json.dumps(sample))
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html; charset=utf-8')
+        path = self.path.lower()
+        if path in ("/test-match", "/test-transfer", "/clear"):
+            # These used to fire on a plain GET, which means a link or <img> tag on any
+            # web page could trigger them. They are POST-only now (use the dashboard buttons).
+            self.send_response(302)
+            self.send_header('Location', '/')
             self.end_headers()
-            self.wfile.write(b'<!DOCTYPE html><html><head><meta http-equiv="refresh" content="2;url=/" /></head><body style="background:#0f172a;color:#10b981;font-family:sans-serif;padding:40px;text-align:center;"><h2>\xe2\x9c\x85 Test Transfer Sent! (\xe2\x82\xac120M Haaland)</h2><p style="color:#f8fafc;">Check your phone app. Redirecting to dashboard...</p></body></html>')
             return
 
         if path in ["/events", "/json", "/api/telemetry"]:
@@ -201,7 +297,7 @@ class TelemetryHandler(http.server.BaseHTTPRequestHandler):
             return
 
         local_ip = get_local_ip()
-        html = f"""<!DOCTYPE html>
+        page = f"""<!DOCTYPE html>
 <html>
 <head>
     <title>EA FC Telemetry Bridge (Python)</title>
@@ -228,16 +324,17 @@ class TelemetryHandler(http.server.BaseHTTPRequestHandler):
             <button class="blue" onclick="fetch('/test-transfer', {{method:'POST'}}).then(()=>location.reload())">⚡ Send Test Transfer (€120M)</button>
             <button class="red" onclick="fetch('/clear', {{method:'POST'}}).then(()=>location.reload())">🗑️ Clear</button>
         </div>
-        <p style="font-size:12px;color:#94a3b8;">Direct browser links: <a href="/test-match" style="color:#38bdf8;">[Send Match]</a> | <a href="/test-transfer" style="color:#38bdf8;">[Send Transfer]</a> | <a href="/events" target="_blank" style="color:#38bdf8;">[View JSON]</a></p>
+        <p style="font-size:12px;color:#94a3b8;"><a href="/events" target="_blank" style="color:#38bdf8;">[View JSON]</a></p>
         <h3>Live Events ({len(events)} queued)</h3>
-        <pre style="background:#0f172a;padding:12px;border-radius:8px;max-height:260px;overflow:auto;font-size:12px;color:#cbd5e1;">{json.dumps(events, indent=2)}</pre>
+        <pre style="background:#0f172a;padding:12px;border-radius:8px;max-height:260px;overflow:auto;font-size:12px;color:#cbd5e1;">{html.escape(json.dumps(events, indent=2))}</pre>
     </div>
 </body>
 </html>"""
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.send_header('Content-Security-Policy', "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
         self.end_headers()
-        self.wfile.write(html.encode('utf-8'))
+        self.wfile.write(page.encode('utf-8'))
 
     def log_message(self, format, *args):
         pass
@@ -557,17 +654,19 @@ def watch_atlas_exports():
 
 if __name__ == "__main__":
     local_ip = get_local_ip()
-    port = 5050
+    port = LOCAL_PORT
     print("===================================================")
     print(f" EA SPORTS FC TELEMETRY BRIDGE (Python)")
     print(f" ⭐ ENTER IN YOUR ANDROID APP:")
     print(f"    http://{local_ip}:{port}")
     print(f" Web Dashboard: http://localhost:{port}")
+    print(" Phone access is read-only; writes are accepted from this PC only.")
     print(" Keep this window open while playing!")
     print("===================================================")
-    
+
     class ReusableServer(socketserver.ThreadingTCPServer):
         allow_reuse_address = True
+        daemon_threads = True
         
     try:
         threading.Thread(target=watch_atlas_exports, daemon=True).start()

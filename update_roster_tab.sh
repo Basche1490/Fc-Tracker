@@ -1,0 +1,2 @@
+sed -i 's/fun RosterTab(players: List<Player>, modifier: Modifier = Modifier) {/fun RosterTab(players: List<Player>, modifier: Modifier = Modifier, onPlayerUpdate: (Player) -> Unit = {}, onPlayerDelete: (String) -> Unit = {}) {/' app/src/main/java/com/example/ui/screens/SquadScreen.kt
+sed -i 's/0 -> RosterTab(state.players, Modifier.weight(1f))/0 -> RosterTab(state.players, Modifier.weight(1f), onPlayerUpdate = { viewModel.updatePlayer(it) }, onPlayerDelete = { viewModel.deletePlayer(it) })/' app/src/main/java/com/example/ui/screens/SquadScreen.kt

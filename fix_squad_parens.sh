@@ -1,0 +1,4 @@
+sed -i 's/modifier = Modifier.weight(1f)$/modifier = Modifier.weight(1f)\n                )/g' app/src/main/java/com/example/ui/screens/SquadScreen.kt
+sed -i 's/modifier = Modifier.fillMaxWidth()$/modifier = Modifier.fillMaxWidth()\n                )/g' app/src/main/java/com/example/ui/screens/SquadScreen.kt
+sed -i 's/modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryEditable, true).fillMaxWidth(),/modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryEditable, true).fillMaxWidth(),\n                            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = searchExpanded) }\n                        )/' app/src/main/java/com/example/ui/screens/SquadScreen.kt
+sed -i '/trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = searchExpanded) }/d' app/src/main/java/com/example/ui/screens/SquadScreen.kt
